@@ -26,6 +26,7 @@ final class AppSettings {
         static let scaleType = "scaleType"
         static let startAutomatically = "startAutomatically"
         static let pauseOnBattery = "pauseOnBattery"
+        static let desktopEnabled = "desktopEnabled"
         static let lockScreenEnabled = "lockScreenEnabled"
     }
 
@@ -48,6 +49,11 @@ final class AppSettings {
     var pauseOnBattery: Bool {
         get { defaults.bool(forKey: Key.pauseOnBattery) }
         set { defaults.set(newValue, forKey: Key.pauseOnBattery) }
+    }
+
+    var desktopEnabled: Bool {
+        get { defaults.bool(forKey: Key.desktopEnabled) }
+        set { defaults.set(newValue, forKey: Key.desktopEnabled) }
     }
 
     var lockScreenEnabled: Bool {
@@ -80,7 +86,6 @@ final class AppSettings {
         if stale {
             try saveVideoURL(url)
         }
-
         return url
     }
 
@@ -164,7 +169,7 @@ final class WallpaperSurface {
             .canJoinAllSpaces,
             .stationary,
             .ignoresCycle,
-            .fullScreenAuxiliary
+            .fullScreenAuxiliary,
         ]
         window.isOpaque = true
         window.backgroundColor = .black
@@ -182,11 +187,14 @@ final class WallpaperSurface {
     private func configurePlayer() {
         player.isMuted = true
         player.actionAtItemEnd = .none
-        player.automaticallyWaitsToMinimizeStalling = true
+        player.automaticallyWaitsToMinimizeStalling = false
+        player.preventsDisplaySleepDuringVideoPlayback = false
     }
 
     private func configureLayer() {
-        guard let rootLayer = window.contentView?.layer else { return }
+        guard let rootLayer = window.contentView?.layer else {
+            return
+        }
         playerLayer.backgroundColor = NSColor.black.cgColor
         playerLayer.needsDisplayOnBoundsChange = true
         rootLayer.addSublayer(playerLayer)
@@ -198,13 +206,24 @@ final class WallpaperSurface {
             object: playerItem,
             queue: .main
         ) { [weak self] _ in
-            guard let self else { return }
-            self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
-                if finished { self.player.play() }
+            guard let self else {
+                return
+            }
+            self.player.seek(
+                to: .zero,
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            ) { finished in
+                if finished {
+                    self.player.playImmediately(atRate: 1)
+                }
             }
         }
 
-        presentationObserver = playerItem.observe(\.presentationSize, options: [.initial, .new]) { [weak self] _, _ in
+        presentationObserver = playerItem.observe(
+            \.presentationSize,
+            options: [.initial, .new]
+        ) { [weak self] _, _ in
             DispatchQueue.main.async {
                 self?.layout()
             }
@@ -214,7 +233,7 @@ final class WallpaperSurface {
     func show() {
         window.setFrame(screen.frame, display: true)
         window.orderFrontRegardless()
-        player.play()
+        player.playImmediately(atRate: 1)
     }
 
     func pause() {
@@ -222,7 +241,7 @@ final class WallpaperSurface {
     }
 
     func resume() {
-        player.play()
+        player.playImmediately(atRate: 1)
     }
 
     func close() {
@@ -232,7 +251,9 @@ final class WallpaperSurface {
     }
 
     func layout() {
-        guard let contentView = window.contentView else { return }
+        guard let contentView = window.contentView else {
+            return
+        }
         let bounds = contentView.bounds
 
         CATransaction.begin()
@@ -242,15 +263,12 @@ final class WallpaperSurface {
         case .fill:
             playerLayer.videoGravity = .resizeAspectFill
             playerLayer.frame = bounds
-
         case .fit:
             playerLayer.videoGravity = .resizeAspect
             playerLayer.frame = bounds
-
         case .stretch:
             playerLayer.videoGravity = .resize
             playerLayer.frame = bounds
-
         case .center:
             playerLayer.videoGravity = .resizeAspect
             let videoSize = playerItem.presentationSize
@@ -335,14 +353,13 @@ final class WallpaperEngine: @unchecked Sendable {
     func start(videoURL: URL, scaleType: VideoScaleType) throws {
         guard FileManager.default.fileExists(atPath: videoURL.path) else {
             throw NSError(
-                domain: "LiveCore",
+                domain: "Livecore",
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "The selected video file could not be found."]
             )
         }
 
         stop()
-
         hasSecurityScope = videoURL.startAccessingSecurityScopedResource()
         securityScopedURL = videoURL
         activeURL = videoURL
@@ -367,183 +384,22 @@ final class WallpaperEngine: @unchecked Sendable {
     }
 
     func resume() {
-        guard activeURL != nil else { return }
+        guard activeURL != nil else {
+            return
+        }
         surfaces.forEach { $0.resume() }
     }
 
     func rebuildForCurrentScreens() {
-        guard let activeURL else { return }
+        guard let activeURL else {
+            return
+        }
 
         surfaces.forEach { $0.close() }
         surfaces = NSScreen.screens.map {
             WallpaperSurface(screen: $0, videoURL: activeURL, scaleType: activeScaleType)
         }
         surfaces.forEach { $0.show() }
-    }
-}
-
-@MainActor
-final class SettingsWindowController: NSWindowController {
-    private let settings = AppSettings.shared
-
-    private let pathLabel = NSTextField(labelWithString: "No video selected")
-    private let chooseButton = NSButton(title: "Choose Video…", target: nil, action: nil)
-    private let scalePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let loginCheckbox = NSButton(checkboxWithTitle: "Launch automatically at login", target: nil, action: nil)
-    private let applyButton = NSButton(title: "Apply and Play", target: nil, action: nil)
-    private let stopButton = NSButton(title: "Stop", target: nil, action: nil)
-    private let statusLabel = NSTextField(labelWithString: "")
-
-    private var selectedURL: URL?
-
-    init() {
-        let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 260),
-            styleMask: [.titled, .closable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Livecore"
-        window.center()
-        window.isReleasedWhenClosed = false
-
-        super.init(window: window)
-        buildUI()
-        loadSettings()
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    private func buildUI() {
-        guard let contentView = window?.contentView else { return }
-
-        chooseButton.target = self
-        chooseButton.action = #selector(chooseVideo)
-        applyButton.target = self
-        applyButton.action = #selector(applyAndPlay)
-        applyButton.keyEquivalent = "\r"
-        stopButton.target = self
-        stopButton.action = #selector(stopPlayback)
-        loginCheckbox.target = self
-        loginCheckbox.action = #selector(loginItemChanged)
-
-        scalePopup.addItems(withTitles: VideoScaleType.allCases.map(\.title))
-
-        pathLabel.lineBreakMode = .byTruncatingMiddle
-        pathLabel.maximumNumberOfLines = 2
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.maximumNumberOfLines = 2
-
-        let videoRow = NSStackView(views: [pathLabel, chooseButton])
-        videoRow.orientation = .horizontal
-        videoRow.spacing = 12
-        pathLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        chooseButton.setContentHuggingPriority(.required, for: .horizontal)
-
-        let scaleLabel = NSTextField(labelWithString: "Appearance:")
-        let scaleRow = NSStackView(views: [scaleLabel, scalePopup])
-        scaleRow.orientation = .horizontal
-        scaleRow.spacing = 12
-        scaleRow.alignment = .centerY
-        scaleLabel.setContentHuggingPriority(.required, for: .horizontal)
-
-        let buttonSpacer = NSView()
-        let buttonRow = NSStackView(views: [buttonSpacer, stopButton, applyButton])
-        buttonRow.orientation = .horizontal
-        buttonRow.spacing = 10
-        buttonSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        let stack = NSStackView(views: [videoRow, scaleRow, loginCheckbox, statusLabel, buttonRow])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 16
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(stack)
-
-        videoRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        scaleRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        buttonRow.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
-            stack.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -24)
-        ])
-    }
-
-    private func loadSettings() {
-        scalePopup.selectItem(at: VideoScaleType.allCases.firstIndex(of: settings.scaleType) ?? 0)
-
-        if #available(macOS 13.0, *) {
-            loginCheckbox.state = LoginItemManager.shared.isEnabled ? .on : .off
-        } else {
-            loginCheckbox.isEnabled = false
-            loginCheckbox.toolTip = "This option requires macOS 13 or later."
-        }
-
-        do {
-            selectedURL = try settings.resolveVideoURL()
-            pathLabel.stringValue = selectedURL?.path ?? "No video selected"
-        } catch {
-            selectedURL = nil
-            pathLabel.stringValue = "The saved video is unavailable; choose it again."
-        }
-    }
-
-    @objc private func chooseVideo() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose a wallpaper video"
-        panel.prompt = "Choose"
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        selectedURL = url
-        pathLabel.stringValue = url.path
-        statusLabel.stringValue = ""
-    }
-
-    @objc private func applyAndPlay() {
-        guard let selectedURL else {
-            statusLabel.stringValue = "Choose a video first."
-            NSSound.beep()
-            return
-        }
-
-        let scale = VideoScaleType.allCases[scalePopup.indexOfSelectedItem]
-
-        do {
-            try settings.saveVideoURL(selectedURL)
-            settings.scaleType = scale
-            try WallpaperEngine.shared.start(videoURL: selectedURL, scaleType: scale)
-            statusLabel.stringValue = "The video is playing on every display."
-        } catch {
-            statusLabel.stringValue = error.localizedDescription
-            presentError(error)
-        }
-    }
-
-    @objc private func stopPlayback() {
-        WallpaperEngine.shared.stop()
-        statusLabel.stringValue = "Playback stopped."
-    }
-
-    @objc private func loginItemChanged() {
-        guard #available(macOS 13.0, *) else { return }
-
-        do {
-            try LoginItemManager.shared.setEnabled(loginCheckbox.state == .on)
-            settings.startAutomatically = loginCheckbox.state == .on
-        } catch {
-            loginCheckbox.state = LoginItemManager.shared.isEnabled ? .on : .off
-            statusLabel.stringValue = "Could not change the startup setting: \(error.localizedDescription)"
-            presentError(error)
-        }
     }
 }
 
@@ -556,19 +412,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         installStatusMenu()
 
+        let settings = AppSettings.shared
         do {
-            if let url = try AppSettings.shared.resolveVideoURL() {
+            let videoURL = try settings.resolveVideoURL()
+
+            if settings.desktopEnabled, let videoURL {
                 try WallpaperEngine.shared.start(
-                    videoURL: url,
-                    scaleType: AppSettings.shared.scaleType
+                    videoURL: videoURL,
+                    scaleType: settings.scaleType
                 )
-                if AppSettings.shared.lockScreenEnabled,
-                   let item = LivecoreWallpaperLibrary.shared.currentItem() {
-                    DispatchQueue.global(qos: .utility).async {
-                        try? WallpaperStoreManager.shared.activateLockScreen(item: item)
+            }
+
+            if settings.lockScreenEnabled,
+               let item = LivecoreWallpaperLibrary.shared.currentItem() {
+                DispatchQueue.global(qos: .utility).async {
+                    do {
+                        try LivecoreWallpaperLibrary.shared.setPlaybackEnabled(true)
+                        try WallpaperStoreManager.shared.activateLockScreen(item: item)
+                    } catch {
+                        try? LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
+                        DispatchQueue.main.async {
+                            AppSettings.shared.lockScreenEnabled = false
+                        }
                     }
                 }
-            } else {
+            }
+
+            if videoURL == nil {
                 showSettings()
             }
         } catch {
@@ -578,23 +448,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        let shouldApplyFallback = WallpaperEngine.shared.isActive
+            || AppSettings.shared.desktopEnabled
+            || AppSettings.shared.lockScreenEnabled
+
         WallpaperEngine.shared.stop()
+        AppSettings.shared.desktopEnabled = false
+        AppSettings.shared.lockScreenEnabled = false
+
+        if shouldApplyFallback {
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { group.leave() }
+                try? LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
+                try? WallpaperStoreManager.shared.applyFallbackWallpaper()
+            }
+            while group.wait(timeout: .now() + 0.05) == .timedOut {
+                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+            }
+        }
     }
 
     private func installStatusMenu() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         item.button?.image = NSImage(
             systemSymbolName: "play.rectangle.on.rectangle",
-            accessibilityDescription: "LiveCore"
+            accessibilityDescription: "Livecore"
         )
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Open App", action: #selector(showSettings), keyEquivalent: ","))
-        menu.addItem(NSMenuItem(title: "Play", action: #selector(playSavedVideo), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Stop", action: #selector(stopPlayback), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Play on Desktop", action: #selector(playSavedVideo), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Stop and Use Livecore Image", action: #selector(stopPlayback), keyEquivalent: ""))
+
         let scaleMenu = NSMenu()
         for (index, scale) in VideoScaleType.allCases.enumerated() {
-            let scaleItem = NSMenuItem(title: scale.title, action: #selector(changeScale(_:)), keyEquivalent: "")
+            let scaleItem = NSMenuItem(
+                title: scale.title,
+                action: #selector(changeScale(_:)),
+                keyEquivalent: ""
+            )
             scaleItem.tag = index
             scaleItem.state = scale == AppSettings.shared.scaleType ? .on : .off
             scaleItem.target = self
@@ -626,7 +520,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 showSettings()
                 return
             }
-            try WallpaperEngine.shared.start(videoURL: url, scaleType: AppSettings.shared.scaleType)
+            try WallpaperEngine.shared.start(
+                videoURL: url,
+                scaleType: AppSettings.shared.scaleType
+            )
+            AppSettings.shared.desktopEnabled = true
         } catch {
             NSApp.presentError(error)
         }
@@ -634,12 +532,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func stopPlayback() {
         WallpaperEngine.shared.stop()
+        AppSettings.shared.desktopEnabled = false
+        AppSettings.shared.lockScreenEnabled = false
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                try LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
+                try WallpaperStoreManager.shared.applyFallbackWallpaper()
+            } catch {
+                DispatchQueue.main.async {
+                    NSApp.presentError(error)
+                }
+            }
+        }
     }
 
     @objc private func changeScale(_ sender: NSMenuItem) {
-        guard VideoScaleType.allCases.indices.contains(sender.tag) else { return }
+        guard VideoScaleType.allCases.indices.contains(sender.tag) else {
+            return
+        }
         AppSettings.shared.scaleType = VideoScaleType.allCases[sender.tag]
-        playSavedVideo()
+        if AppSettings.shared.desktopEnabled {
+            playSavedVideo()
+        }
         sender.menu?.items.forEach { $0.state = $0 === sender ? .on : .off }
     }
 

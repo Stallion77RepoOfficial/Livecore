@@ -10,18 +10,27 @@
 @property(nonatomic, readonly) uint32_t contextId;
 @end
 
-static NSMutableArray *LivecoreContexts(void) {
-    static NSMutableArray *contexts;
+static NSMutableDictionary<NSNumber *, CAContext *> *LivecoreContexts(void) {
+    static NSMutableDictionary<NSNumber *, CAContext *> *contexts;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ contexts = [NSMutableArray array]; });
+    dispatch_once(&once, ^{ contexts = [NSMutableDictionary dictionary]; });
     return contexts;
 }
 
-static NSMutableArray *LivecoreSurfaces(void) {
-    static NSMutableArray *surfaces;
+static NSMutableArray<IOSurface *> *LivecoreSurfaces(void) {
+    static NSMutableArray<IOSurface *> *surfaces;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ surfaces = [NSMutableArray array]; });
     return surfaces;
+}
+
+static uint32_t LCContextIdentifierFromWrapper(WallpaperRemoteContextXPC *wrapper) {
+    if (!wrapper) return 0;
+    Class wrapperClass = object_getClass(wrapper);
+    Ivar box = class_getInstanceVariable(wrapperClass, "box");
+    ptrdiff_t offset = box ? ivar_getOffset(box) : 8;
+    if (offset < 0 || (size_t)offset + sizeof(uint32_t) > class_getInstanceSize(wrapperClass)) return 0;
+    return *(uint32_t *)((uint8_t *)(__bridge void *)wrapper + offset);
 }
 
 WallpaperRemoteContextXPC *LCCreateRemoteContext(CALayer *rootLayer) {
@@ -32,14 +41,29 @@ WallpaperRemoteContextXPC *LCCreateRemoteContext(CALayer *rootLayer) {
 
     CAContext *context = [contextClass remoteContextWithOptions:@{}];
     context.layer = rootLayer;
-    @synchronized (LivecoreContexts()) { [LivecoreContexts() addObject:context]; }
+    @synchronized (LivecoreContexts()) {
+        LivecoreContexts()[@(context.contextId)] = context;
+    }
 
     id wrapper = class_createInstance(wrapperClass, 0);
     Ivar box = class_getInstanceVariable(wrapperClass, "box");
     ptrdiff_t offset = box ? ivar_getOffset(box) : 8;
-    if (!wrapper || offset < 0 || (size_t)offset + sizeof(uint32_t) > class_getInstanceSize(wrapperClass)) return nil;
+    if (!wrapper || offset < 0 || (size_t)offset + sizeof(uint32_t) > class_getInstanceSize(wrapperClass)) {
+        @synchronized (LivecoreContexts()) {
+            [LivecoreContexts() removeObjectForKey:@(context.contextId)];
+        }
+        return nil;
+    }
     *(uint32_t *)((uint8_t *)(__bridge void *)wrapper + offset) = context.contextId;
     return wrapper;
+}
+
+void LCReleaseRemoteContext(WallpaperRemoteContextXPC *wrapper) {
+    uint32_t identifier = LCContextIdentifierFromWrapper(wrapper);
+    if (identifier == 0) return;
+    @synchronized (LivecoreContexts()) {
+        [LivecoreContexts() removeObjectForKey:@(identifier)];
+    }
 }
 
 WallpaperSnapshotXPC *LCCreateWallpaperSnapshot(CGImageRef image) {
@@ -68,7 +92,12 @@ WallpaperSnapshotXPC *LCCreateWallpaperSnapshot(CGImageRef image) {
     CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
     CGContextRelease(context);
     [surface unlockWithOptions:0 seed:nil];
-    @synchronized (LivecoreSurfaces()) { [LivecoreSurfaces() addObject:surface]; }
+    @synchronized (LivecoreSurfaces()) {
+        [LivecoreSurfaces() addObject:surface];
+        while (LivecoreSurfaces().count > 16) {
+            [LivecoreSurfaces() removeObjectAtIndex:0];
+        }
+    }
 
     id wrapper = class_createInstance(wrapperClass, 0);
     Ivar rawValue = class_getInstanceVariable(wrapperClass, "rawValue");

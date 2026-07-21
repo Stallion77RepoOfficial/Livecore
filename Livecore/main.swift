@@ -457,8 +457,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppSettings.shared.lockScreenEnabled = false
 
         if shouldApplyFallback {
-            try? LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
-            try? WallpaperStoreManager.shared.applyFallbackWallpaper()
+            let group = DispatchGroup()
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                defer { group.leave() }
+                try? LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
+                try? WallpaperStoreManager.shared.applyFallbackWallpaper()
+            }
+            while group.wait(timeout: .now() + 0.05) == .timedOut {
+                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
+            }
         }
     }
 

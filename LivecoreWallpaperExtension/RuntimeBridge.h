@@ -12,5 +12,6 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 WallpaperRemoteContextXPC * _Nullable LCCreateRemoteContext(CALayer *rootLayer);
+void LCReleaseRemoteContext(WallpaperRemoteContextXPC *context);
 WallpaperSnapshotXPC * _Nullable LCCreateWallpaperSnapshot(CGImageRef image);
 NS_ASSUME_NONNULL_END

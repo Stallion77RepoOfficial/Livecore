@@ -1,0 +1,31 @@
+// swift-interface-format-version: 1.0
+// swift-compiler-version: Apple Swift version 6.3.3
+// swift-module-flags: -target arm64-apple-macos15.0 -enable-library-evolution -module-name WallpaperTypes
+import Foundation
+import Swift
+
+public struct WallpaperChoiceProviderID : Swift.RawRepresentable, Swift.Hashable, Swift.Codable {
+  public let rawValue: Swift.String
+  public init(rawValue: Swift.String)
+}
+
+public struct WallpaperChoiceDescriptor : Swift.Hashable, Swift.Codable {
+  public var provider: WallpaperTypes.WallpaperChoiceProviderID { get }
+  public var files: [Foundation.URL] { get }
+  public var configuration: Foundation.Data { get }
+  public init(provider: WallpaperTypes.WallpaperChoiceProviderID, files: [Foundation.URL], configuration: Foundation.Data)
+}
+
+public struct WallpaperChoice {
+  public struct ID : Swift.Hashable, Swift.Codable {
+    public var descriptor: WallpaperTypes.WallpaperChoiceDescriptor { get }
+    public init(descriptor: WallpaperTypes.WallpaperChoiceDescriptor)
+  }
+}
+
+public struct WallpaperChoiceOptionValues : Swift.Hashable, Swift.Codable {
+  public enum Kind : Swift.Hashable, Swift.Codable {
+  }
+  public var values: [Swift.String : WallpaperTypes.WallpaperChoiceOptionValues.Kind] { get set }
+  public init(values: [Swift.String : WallpaperTypes.WallpaperChoiceOptionValues.Kind])
+}

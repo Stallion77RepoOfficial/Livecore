@@ -24,10 +24,7 @@ final class AppSettings {
     private enum Key {
         static let videoBookmark = "videoBookmark"
         static let scaleType = "scaleType"
-        static let startAutomatically = "startAutomatically"
-        static let pauseOnBattery = "pauseOnBattery"
         static let desktopEnabled = "desktopEnabled"
-        static let lockScreenEnabled = "lockScreenEnabled"
     }
 
     private let defaults = UserDefaults.standard
@@ -41,24 +38,9 @@ final class AppSettings {
         }
     }
 
-    var startAutomatically: Bool {
-        get { defaults.object(forKey: Key.startAutomatically) as? Bool ?? true }
-        set { defaults.set(newValue, forKey: Key.startAutomatically) }
-    }
-
-    var pauseOnBattery: Bool {
-        get { defaults.bool(forKey: Key.pauseOnBattery) }
-        set { defaults.set(newValue, forKey: Key.pauseOnBattery) }
-    }
-
     var desktopEnabled: Bool {
         get { defaults.bool(forKey: Key.desktopEnabled) }
         set { defaults.set(newValue, forKey: Key.desktopEnabled) }
-    }
-
-    var lockScreenEnabled: Bool {
-        get { defaults.bool(forKey: Key.lockScreenEnabled) }
-        set { defaults.set(newValue, forKey: Key.lockScreenEnabled) }
     }
 
     func saveVideoURL(_ url: URL) throws {
@@ -171,8 +153,8 @@ final class WallpaperSurface {
             .ignoresCycle,
             .fullScreenAuxiliary,
         ]
-        window.isOpaque = true
-        window.backgroundColor = .black
+        window.isOpaque = false
+        window.backgroundColor = .clear
         window.hasShadow = false
         window.ignoresMouseEvents = true
         window.isReleasedWhenClosed = false
@@ -180,7 +162,7 @@ final class WallpaperSurface {
         let contentView = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
         contentView.wantsLayer = true
         contentView.layer = CALayer()
-        contentView.layer?.backgroundColor = NSColor.black.cgColor
+        contentView.layer?.backgroundColor = NSColor.clear.cgColor
         window.contentView = contentView
     }
 
@@ -195,7 +177,7 @@ final class WallpaperSurface {
         guard let rootLayer = window.contentView?.layer else {
             return
         }
-        playerLayer.backgroundColor = NSColor.black.cgColor
+        playerLayer.backgroundColor = NSColor.clear.cgColor
         playerLayer.needsDisplayOnBoundsChange = true
         rootLayer.addSublayer(playerLayer)
     }
@@ -423,21 +405,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
 
-            if settings.lockScreenEnabled,
-               let item = LivecoreWallpaperLibrary.shared.currentItem() {
-                DispatchQueue.global(qos: .utility).async {
-                    do {
-                        try LivecoreWallpaperLibrary.shared.setPlaybackEnabled(true)
-                        try WallpaperStoreManager.shared.activateLockScreen(item: item)
-                    } catch {
-                        try? LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
-                        DispatchQueue.main.async {
-                            AppSettings.shared.lockScreenEnabled = false
-                        }
-                    }
-                }
-            }
-
             if videoURL == nil {
                 showSettings()
             }
@@ -448,26 +415,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        let shouldApplyFallback = WallpaperEngine.shared.isActive
-            || AppSettings.shared.desktopEnabled
-            || AppSettings.shared.lockScreenEnabled
-
+        // The Lock Screen extension is owned by macOS and survives the host app.
+        // Preserve the user's Desktop preference across logout, crashes, and
+        // Xcode relaunches; an explicit Stop/Quit action clears it instead.
         WallpaperEngine.shared.stop()
-        AppSettings.shared.desktopEnabled = false
-        AppSettings.shared.lockScreenEnabled = false
-
-        if shouldApplyFallback {
-            let group = DispatchGroup()
-            group.enter()
-            DispatchQueue.global(qos: .userInitiated).async {
-                defer { group.leave() }
-                try? LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
-                try? WallpaperStoreManager.shared.applyFallbackWallpaper()
-            }
-            while group.wait(timeout: .now() + 0.05) == .timedOut {
-                RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.05))
-            }
-        }
     }
 
     private func installStatusMenu() {
@@ -480,7 +431,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(NSMenuItem(title: "Open App", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Play on Desktop", action: #selector(playSavedVideo), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Stop and Use Livecore Image", action: #selector(stopPlayback), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Stop Desktop Playback", action: #selector(stopPlayback), keyEquivalent: ""))
 
         let scaleMenu = NSMenu()
         for (index, scale) in VideoScaleType.allCases.enumerated() {
@@ -533,18 +484,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func stopPlayback() {
         WallpaperEngine.shared.stop()
         AppSettings.shared.desktopEnabled = false
-        AppSettings.shared.lockScreenEnabled = false
-
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                try LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
-                try WallpaperStoreManager.shared.applyFallbackWallpaper()
-            } catch {
-                DispatchQueue.main.async {
-                    NSApp.presentError(error)
-                }
-            }
-        }
     }
 
     @objc private func changeScale(_ sender: NSMenuItem) {
@@ -559,6 +498,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quit() {
+        WallpaperEngine.shared.stop()
+        AppSettings.shared.desktopEnabled = false
         NSApp.terminate(nil)
     }
 }

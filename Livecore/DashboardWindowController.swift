@@ -15,12 +15,16 @@ final class DashboardWindowController: NSWindowController {
     )
     private let loginSwitch = NSSwitch()
     private var selectedURL: URL?
+    private var previewSecurityScopedURL: URL?
     private var isBusy = false
+    private var needsLockScreenApply = true
+    private var stateObservers: [NSObjectProtocol] = []
 
     private var chooseButton: NSButton?
     private var playButton: NSButton?
     private var lockScreenButton: NSButton?
-    private var stopButton: NSButton?
+    private var stopDesktopButton: NSButton?
+    private var stopLockScreenButton: NSButton?
     private var pluginButton: NSButton?
 
     init() {
@@ -40,10 +44,22 @@ final class DashboardWindowController: NSWindowController {
         super.init(window: window)
         buildUI()
         loadSettings()
+        observeExternalState()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    deinit {
+        stateObservers.forEach(NotificationCenter.default.removeObserver)
+        stateObservers.forEach(DistributedNotificationCenter.default().removeObserver)
+        previewSecurityScopedURL?.stopAccessingSecurityScopedResource()
+    }
+
+    override func showWindow(_ sender: Any?) {
+        super.showWindow(sender)
+        updateButtonStates()
     }
 
     private func buildUI() {
@@ -90,10 +106,15 @@ final class DashboardWindowController: NSWindowController {
             action: #selector(applyToLockScreen),
             prominent: true
         )
-        let stop = actionButton(
-            "Stop",
+        let stopDesktop = actionButton(
+            "Stop Desktop",
             symbol: "stop.fill",
-            action: #selector(stopWallpaper)
+            action: #selector(stopDesktopWallpaper)
+        )
+        let stopLockScreen = actionButton(
+            "Stop Lock Screen",
+            symbol: "lock.slash",
+            action: #selector(stopLockScreenWallpaper)
         )
         let plugin = actionButton(
             "Remove Extension",
@@ -104,10 +125,11 @@ final class DashboardWindowController: NSWindowController {
         chooseButton = choose
         playButton = play
         lockScreenButton = lockScreen
-        stopButton = stop
+        stopDesktopButton = stopDesktop
+        stopLockScreenButton = stopLockScreen
         pluginButton = plugin
 
-        let videoButtons = NSStackView(views: [choose, play, lockScreen, stop, plugin])
+        let videoButtons = NSStackView(views: [choose, play, lockScreen, stopDesktop, stopLockScreen, plugin])
         videoButtons.orientation = .horizontal
         videoButtons.spacing = 8
 
@@ -168,18 +190,34 @@ final class DashboardWindowController: NSWindowController {
     }
 
     func updateButtonStates() {
-        let isInstalled = WallpaperStoreManager.shared.isPluginInstalled()
+        let state = WallpaperStoreManager.shared.lockScreenState()
+        let isInstalled = state.pluginInstalled
+        let supportsLockScreen = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26
         let hasVideo = selectedURL != nil
         let isDesktopActive = WallpaperEngine.shared.isActive || settings.desktopEnabled
-        let isLockScreenActive = settings.lockScreenEnabled
-        let isAnyActive = isDesktopActive || isLockScreenActive
-
         chooseButton?.isEnabled = !isBusy
         scaleControl.isEnabled = !isBusy
-        stopButton?.isEnabled = !isBusy && isAnyActive
+        stopDesktopButton?.isEnabled = !isBusy && isDesktopActive
+        stopLockScreenButton?.isEnabled = !isBusy && state.canStop
         playButton?.isEnabled = !isBusy && hasVideo && !isDesktopActive
-        lockScreenButton?.isEnabled = !isBusy && hasVideo && !isLockScreenActive
+        lockScreenButton?.isEnabled = !isBusy
+            && supportsLockScreen
+            && hasVideo
+            && (needsLockScreenApply || !state.isHealthy)
         pluginButton?.isEnabled = !isBusy
+            && supportsLockScreen
+            && (isInstalled || hasVideo || LivecoreWallpaperLibrary.shared.currentItem() != nil)
+
+        if state.isHealthy && !needsLockScreenApply {
+            lockScreenButton?.title = "Applied to Lock Screen"
+            lockScreenButton?.image = NSImage(systemSymbolName: "checkmark.circle.fill", accessibilityDescription: nil)
+        } else if state.isSelected {
+            lockScreenButton?.title = "Repair Lock Screen"
+            lockScreenButton?.image = NSImage(systemSymbolName: "wrench.and.screwdriver.fill", accessibilityDescription: nil)
+        } else {
+            lockScreenButton?.title = "Apply to Lock Screen"
+            lockScreenButton?.image = NSImage(systemSymbolName: "lock.fill", accessibilityDescription: nil)
+        }
 
         if isInstalled {
             pluginButton?.title = "Remove Extension"
@@ -251,13 +289,99 @@ final class DashboardWindowController: NSWindowController {
             if let selectedURL {
                 showPreview(selectedURL)
             }
+            // Applied is a runtime-verified state, not merely a persisted store
+            // selection. publishCurrentSelectionIfNeeded performs the fresh
+            // extension probe and clears this flag only after it succeeds.
+            needsLockScreenApply = true
         } catch {
             setStatus(error.localizedDescription, error: true)
         }
         updateButtonStates()
+        publishCurrentSelectionIfNeeded()
+    }
+
+    private func publishCurrentSelectionIfNeeded() {
+        guard let selectedURL,
+              WallpaperStoreManager.shared.isPluginInstalled()
+        else { return }
+        if let item = LivecoreWallpaperLibrary.shared.currentItem(),
+           LivecoreWallpaperLibrary.shared.itemIsUsable(item) {
+            setBusy(true)
+            setStatus("Refreshing Livecore in Wallpaper Settings…")
+            Task {
+                do {
+                    try await WallpaperStoreManager.shared.refreshWallpaperSettingsModel()
+                    needsLockScreenApply = !WallpaperStoreManager.shared.lockScreenState().isHealthy
+                    setBusy(false)
+                    setStatus("Video is available in Wallpaper Settings.")
+                } catch {
+                    needsLockScreenApply = true
+                    setBusy(false)
+                    setStatus(error.localizedDescription, error: true)
+                }
+            }
+            return
+        }
+
+        let previousItem = LivecoreWallpaperLibrary.shared.currentItem()
+        let previousState = WallpaperStoreManager.shared.lockScreenState()
+        setBusy(true)
+        setStatus("Publishing the selected video to Wallpaper Settings…")
+        DispatchQueue.global(qos: .userInitiated).async {
+            [weak self, selectedURL, previousItem, previousState] in
+            Task {
+                var preparedItem: LivecoreWallpaperItem?
+                do {
+                    let item = try LivecoreWallpaperLibrary.shared.prepareVideo(
+                        at: selectedURL,
+                        inheritingDesktopFrom: previousItem
+                    )
+                    preparedItem = item
+                    try LivecoreWallpaperLibrary.shared.publish(item, playbackEnabled: true)
+                    try await WallpaperStoreManager.shared.refreshWallpaperSettingsModel()
+                    DispatchQueue.main.async {
+                        self?.needsLockScreenApply = true
+                        self?.setBusy(false)
+                        self?.setStatus("Video is available in Wallpaper Settings.")
+                    }
+                } catch {
+                    LivecoreWallpaperLibrary.shared.restore(
+                        previousItem,
+                        playbackEnabled: previousState.isHealthy
+                    )
+                    if let preparedItem {
+                        LivecoreWallpaperLibrary.shared.discard(preparedItem)
+                    }
+                    DispatchQueue.main.async {
+                        self?.setBusy(false)
+                        self?.setStatus(error.localizedDescription, error: true)
+                    }
+                }
+            }
+        }
+    }
+
+    private func observeExternalState() {
+        stateObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.updateButtonStates() }
+        })
+        stateObservers.append(DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.wallpaper.changed"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.updateButtonStates() }
+        })
     }
 
     private func showPreview(_ url: URL) {
+        preview.player?.pause()
+        previewSecurityScopedURL?.stopAccessingSecurityScopedResource()
+        previewSecurityScopedURL = url.startAccessingSecurityScopedResource() ? url : nil
         pathLabel.stringValue = url.path
         let player = AVPlayer(url: url)
         player.isMuted = true
@@ -284,8 +408,9 @@ final class DashboardWindowController: NSWindowController {
         }
 
         selectedURL = url
+        needsLockScreenApply = true
         showPreview(url)
-        setStatus("Video is ready to preview.")
+        setStatus("Video is ready. Apply it to Desktop or Lock Screen.")
         updateButtonStates()
     }
 
@@ -314,29 +439,35 @@ final class DashboardWindowController: NSWindowController {
         }
     }
 
-    @objc private func stopWallpaper() {
-        guard WallpaperEngine.shared.isActive || settings.desktopEnabled || settings.lockScreenEnabled else {
-            return
-        }
-
+    @objc private func stopDesktopWallpaper() {
         WallpaperEngine.shared.stop()
         settings.desktopEnabled = false
-        settings.lockScreenEnabled = false
+        setStatus("Desktop playback stopped. The macOS wallpaper is visible again.")
+        updateButtonStates()
+    }
+
+    @objc private func stopLockScreenWallpaper() {
+        guard WallpaperStoreManager.shared.lockScreenState().canStop else {
+            updateButtonStates()
+            return
+        }
         setBusy(true)
-        setStatus("Stopping playback and applying the built-in Livecore image…")
+        setStatus("Restoring the previous Lock Screen wallpaper…")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            do {
-                try LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
-                try WallpaperStoreManager.shared.applyFallbackWallpaper()
-                DispatchQueue.main.async {
-                    self?.setBusy(false)
-                    self?.setStatus("Playback stopped. The built-in Livecore image is active on Desktop and Lock Screen.")
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self?.setBusy(false)
-                    self?.setStatus(error.localizedDescription, error: true)
+            Task {
+                do {
+                    try await WallpaperStoreManager.shared.deactivateLockScreen()
+                    DispatchQueue.main.async {
+                        self?.needsLockScreenApply = self?.selectedURL != nil
+                        self?.setBusy(false)
+                        self?.setStatus("Lock Screen restored. Desktop was left unchanged.")
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        self?.setBusy(false)
+                        self?.setStatus(error.localizedDescription, error: true)
+                    }
                 }
             }
         }
@@ -374,26 +505,45 @@ final class DashboardWindowController: NSWindowController {
         }
 
         setBusy(true)
-        setStatus("Installing and selecting Livecore for the Lock Screen…")
+        setStatus("Preparing, selecting, and verifying the Lock Screen renderer…")
+        let previousItem = LivecoreWallpaperLibrary.shared.currentItem()
+        let previousState = WallpaperStoreManager.shared.lockScreenState()
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self, selectedURL] in
-            do {
-                try WallpaperStoreManager.shared.installPlugin()
-                let item = try LivecoreWallpaperLibrary.shared.importVideo(at: selectedURL)
-                try LivecoreWallpaperLibrary.shared.setPlaybackEnabled(true)
-                try WallpaperStoreManager.shared.activateLockScreen(item: item)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, selectedURL, previousItem, previousState] in
+            Task {
+                var preparedItem: LivecoreWallpaperItem?
+                do {
+                    let item = try LivecoreWallpaperLibrary.shared.prepareVideo(
+                        at: selectedURL,
+                        inheritingDesktopFrom: previousItem
+                    )
+                    preparedItem = item
+                    try LivecoreWallpaperLibrary.shared.publish(item, playbackEnabled: true)
+                    try await WallpaperStoreManager.shared.installPlugin()
+                    try await WallpaperStoreManager.shared.activateLockScreen(item: item)
 
-                DispatchQueue.main.async {
-                    AppSettings.shared.lockScreenEnabled = true
-                    self?.setBusy(false)
-                    self?.setStatus("Video applied to the Lock Screen. Desktop was left unchanged.")
-                }
-            } catch {
-                try? LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
-                DispatchQueue.main.async {
-                    AppSettings.shared.lockScreenEnabled = false
-                    self?.setBusy(false)
-                    self?.setStatus(error.localizedDescription, error: true)
+                    DispatchQueue.main.async {
+                        self?.needsLockScreenApply = false
+                        self?.setBusy(false)
+                        self?.setStatus("Lock Screen renderer verified. Desktop remains visually unchanged.")
+                    }
+                } catch {
+                    let mustPreserve = (error as? LivecoreProviderError)?.mustPreservePublishedItem == true
+                    if !mustPreserve {
+                        LivecoreWallpaperLibrary.shared.restore(
+                            previousItem,
+                            playbackEnabled: previousState.isHealthy
+                        )
+                        if let preparedItem {
+                            LivecoreWallpaperLibrary.shared.discard(preparedItem)
+                        }
+                    }
+                    WallpaperStoreManager.shared.refreshWallpaperSettings()
+                    DispatchQueue.main.async {
+                        self?.needsLockScreenApply = true
+                        self?.setBusy(false)
+                        self?.setStatus(error.localizedDescription, error: true)
+                    }
                 }
             }
         }
@@ -406,26 +556,65 @@ final class DashboardWindowController: NSWindowController {
         if isInstalled {
             setStatus("Removing Livecore extension…")
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                WallpaperStoreManager.shared.uninstallPlugin()
-                DispatchQueue.main.async {
-                    AppSettings.shared.lockScreenEnabled = false
-                    self?.setBusy(false)
-                    self?.setStatus("Extension removed from System Settings.")
+                Task {
+                    do {
+                        try await WallpaperStoreManager.shared.uninstallPlugin()
+                        DispatchQueue.main.async {
+                            self?.needsLockScreenApply = self?.selectedURL != nil
+                            self?.setBusy(false)
+                            self?.setStatus("Extension removed; the previous Lock Screen wallpaper was restored.")
+                        }
+                    } catch {
+                        DispatchQueue.main.async {
+                            self?.setBusy(false)
+                            self?.setStatus(error.localizedDescription, error: true)
+                        }
+                    }
                 }
             }
         } else {
+            guard selectedURL != nil || LivecoreWallpaperLibrary.shared.currentItem() != nil else {
+                setBusy(false)
+                setStatus("Choose a video before installing the extension.", error: true)
+                return
+            }
             setStatus("Installing Livecore extension…")
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                do {
-                    try WallpaperStoreManager.shared.installPlugin()
-                    DispatchQueue.main.async {
-                        self?.setBusy(false)
-                        self?.setStatus("Extension installed into System Settings.")
-                    }
-                } catch {
-                    DispatchQueue.main.async {
-                        self?.setBusy(false)
-                        self?.setStatus(error.localizedDescription, error: true)
+            let sourceURL = selectedURL
+            let previousItem = LivecoreWallpaperLibrary.shared.currentItem()
+            let previousState = WallpaperStoreManager.shared.lockScreenState()
+            DispatchQueue.global(qos: .userInitiated).async {
+                [weak self, sourceURL, previousItem, previousState] in
+                Task {
+                    var preparedItem: LivecoreWallpaperItem?
+                    do {
+                        if let sourceURL {
+                            let item = try LivecoreWallpaperLibrary.shared.prepareVideo(
+                                at: sourceURL,
+                                inheritingDesktopFrom: previousItem
+                            )
+                            preparedItem = item
+                            try LivecoreWallpaperLibrary.shared.publish(item, playbackEnabled: true)
+                        } else if let previousItem {
+                            try LivecoreWallpaperLibrary.shared.publish(previousItem, playbackEnabled: true)
+                        }
+                        try await WallpaperStoreManager.shared.installPlugin()
+                        DispatchQueue.main.async {
+                            self?.needsLockScreenApply = true
+                            self?.setBusy(false)
+                            self?.setStatus("Extension installed; the video is available in Wallpaper Settings.")
+                        }
+                    } catch {
+                        LivecoreWallpaperLibrary.shared.restore(
+                            previousItem,
+                            playbackEnabled: previousState.isHealthy
+                        )
+                        if let preparedItem {
+                            LivecoreWallpaperLibrary.shared.discard(preparedItem)
+                        }
+                        DispatchQueue.main.async {
+                            self?.setBusy(false)
+                            self?.setStatus(error.localizedDescription, error: true)
+                        }
                     }
                 }
             }

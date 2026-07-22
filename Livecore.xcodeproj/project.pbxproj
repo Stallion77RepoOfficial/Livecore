@@ -10,6 +10,7 @@
 		04AD7454600A6F4C21A373A1 /* RuntimeBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 64A9806DD5359739C5B62112 /* RuntimeBridge.m */; };
 		27864213D4D8AE78F5811673 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D422873AE4BA492CA54811D /* main.swift */; };
 		3828FA2C7B9F94B0911356A4 /* LivecoreWallpaperExtension.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1316E3AE7307831484C97E4E /* LivecoreWallpaperExtension.swift */; };
+		5BADCD87088C4F86B3E55311 /* PrivateWallpaperSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9B6C00874619E0FC7C5F1B4 /* PrivateWallpaperSettings.swift */; };
 		61325E2F7D28545D827D56E0 /* LivecoreWallpaperProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 703B1D981D2C608069E65CE6 /* LivecoreWallpaperProvider.swift */; };
 		704471F0C0B357A17C096F9A /* LivecoreWallpaperExtension.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 255316117574CB68DA99F8B0 /* LivecoreWallpaperExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		DAED500484ACE99CE0DC1A69 /* DashboardWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67787413D04C910763363708 /* DashboardWindowController.swift */; };
@@ -50,6 +51,7 @@
 		67787413D04C910763363708 /* DashboardWindowController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardWindowController.swift; sourceTree = "<group>"; };
 		703B1D981D2C608069E65CE6 /* LivecoreWallpaperProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LivecoreWallpaperProvider.swift; sourceTree = "<group>"; };
 		8D422873AE4BA492CA54811D /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		A9B6C00874619E0FC7C5F1B4 /* PrivateWallpaperSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivateWallpaperSettings.swift; sourceTree = "<group>"; };
 		DDF1C44BA78129E3D1411028 /* LivecoreWallpaperExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = LivecoreWallpaperExtension.entitlements; sourceTree = "<group>"; };
 		E4DA6FC9CE599655B91907D7 /* Livecore.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Livecore.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -93,6 +95,7 @@
 				E4DA6FC9CE599655B91907D7 /* Livecore.entitlements */,
 				703B1D981D2C608069E65CE6 /* LivecoreWallpaperProvider.swift */,
 				8D422873AE4BA492CA54811D /* main.swift */,
+				A9B6C00874619E0FC7C5F1B4 /* PrivateWallpaperSettings.swift */,
 			);
 			path = Livecore;
 			sourceTree = "<group>";
@@ -122,6 +125,7 @@
 			buildConfigurationList = C205EE5FA5300123F6D75374 /* Build configuration list for PBXNativeTarget "Livecore" */;
 			buildPhases = (
 				9D22943780E79FF80F7F963E /* Sources */,
+				11D7820889522ED4F130DC94 /* Resources */,
 				E63D0135465282948CA094D0 /* Embed ExtensionKit Extensions */,
 			);
 			buildRules = (
@@ -143,15 +147,15 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 1430;
+				LastUpgradeCheck = 1600;
 				TargetAttributes = {
 					08CDEAAC7833F6A82D0D330F = {
-						DevelopmentTeam = 345USFAYPB;
-						ProvisioningStyle = Automatic;
+						DevelopmentTeam = "";
+						ProvisioningStyle = Manual;
 					};
 					1F63DF48781826E9AB5FF92B = {
-						DevelopmentTeam = 345USFAYPB;
-						ProvisioningStyle = Automatic;
+						DevelopmentTeam = "";
+						ProvisioningStyle = Manual;
 					};
 				};
 			};
@@ -175,6 +179,16 @@
 		};
 /* End PBXProject section */
 
+/* Begin PBXResourcesBuildPhase section */
+		11D7820889522ED4F130DC94 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
 /* Begin PBXSourcesBuildPhase section */
 		9D22943780E79FF80F7F963E /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
@@ -182,6 +196,7 @@
 			files = (
 				DAED500484ACE99CE0DC1A69 /* DashboardWindowController.swift in Sources */,
 				61325E2F7D28545D827D56E0 /* LivecoreWallpaperProvider.swift in Sources */,
+				5BADCD87088C4F86B3E55311 /* PrivateWallpaperSettings.swift in Sources */,
 				27864213D4D8AE78F5811673 /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -210,8 +225,13 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
+				ARCHS = arm64;
 				CODE_SIGN_ENTITLEMENTS = LivecoreWallpaperExtension/LivecoreWallpaperExtension.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = "";
 				INFOPLIST_FILE = LivecoreWallpaperExtension/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -264,6 +284,7 @@
 				DEVELOPMENT_TEAM = 345USFAYPB;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				ENABLE_TESTABILITY = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_DYNAMIC_NO_PIC = NO;
@@ -294,32 +315,53 @@
 		56182F68A10071BB6FD78956 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Livecore/Livecore.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = "";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SDKROOT)/System/Library/PrivateFrameworks",
+				);
 				INFOPLIST_FILE = Livecore/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				OTHER_LDFLAGS = "$(inherited) -framework Wallpaper -framework WallpaperTypes";
 				PRODUCT_BUNDLE_IDENTIFIER = com.berkegulacar.Livecore;
 				SDKROOT = macosx;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/PrivateModules";
 			};
 			name = Debug;
 		};
 		6018C420A613FD2A4F5EB120 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_ENTITLEMENTS = Livecore/Livecore.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
+				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = "";
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SDKROOT)/System/Library/PrivateFrameworks",
+				);
 				INFOPLIST_FILE = Livecore/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
+				OTHER_LDFLAGS = "$(inherited) -framework Wallpaper -framework WallpaperTypes";
 				PRODUCT_BUNDLE_IDENTIFIER = com.berkegulacar.Livecore;
 				SDKROOT = macosx;
+				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/PrivateModules";
 			};
 			name = Release;
 		};
@@ -363,6 +405,7 @@
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
@@ -386,15 +429,19 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
+				ARCHS = arm64;
 				CODE_SIGN_ENTITLEMENTS = LivecoreWallpaperExtension/LivecoreWallpaperExtension.entitlements;
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
+				DEVELOPMENT_TEAM = "";
 				INFOPLIST_FILE = LivecoreWallpaperExtension/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.berkegulacar.Livecore.wallpaper-extension";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.berkegulacar.Livecore.wallpaper-extension.debug";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = LivecoreWallpaperExtension/RuntimeBridge.h;

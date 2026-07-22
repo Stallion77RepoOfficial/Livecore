@@ -1,0 +1,43 @@
+// swift-interface-format-version: 1.0
+// swift-compiler-version: Apple Swift version 6.3.3
+// swift-module-flags: -target arm64-apple-macos15.0 -enable-library-evolution -module-name Wallpaper
+import Foundation
+import Swift
+import WallpaperTypes
+
+public enum ContentType : Swift.CaseIterable, Swift.Codable, Swift.Hashable, Swift.CustomStringConvertible {
+  case desktop
+  case screenSaver
+  public static var allCases: [Wallpaper.ContentType] { get }
+  public var description: Swift.String { get }
+}
+
+public enum ViewModelRefreshReason : Swift.Codable, Swift.Hashable {
+  case launch
+  case navigation
+  case wallpaperInstallation
+}
+
+public struct WallpaperContentSettings : Swift.Hashable, Swift.Codable {
+  public var choices: [WallpaperTypes.WallpaperChoice.ID]
+  public var useAsDesktopWallpaperAndIdleWallpaper: Swift.Bool
+  public init(choices: [WallpaperTypes.WallpaperChoice.ID], useAsDesktopWallpaperAndIdleWallpaper: Swift.Bool, optionValues: WallpaperTypes.WallpaperChoiceOptionValues? = nil)
+}
+
+public enum WallpaperUserSettings : Swift.Codable {
+  public struct DisplaySpace : Swift.Hashable, Swift.Codable {
+    public init(displayID: Swift.UInt32) throws
+    public var display: Swift.String { get }
+    public var space: Swift.String { get }
+  }
+  case allDisplays(Wallpaper.WallpaperContentSettings)
+  case perDisplaySpace([Wallpaper.WallpaperUserSettings.DisplaySpace : Wallpaper.WallpaperContentSettings])
+}
+
+public final class WallpaperSettingsManager {
+  public static var shared: Wallpaper.WallpaperSettingsManager { get }
+  public var desktopWallpaperUserSettings: Wallpaper.WallpaperUserSettings { get }
+  public func synchronize() async throws
+  public func ensureViewModelIsUpToDate(contentTypes: [Wallpaper.ContentType], reason: Wallpaper.ViewModelRefreshReason) async throws
+  public func updateDesktopWallpaperUserSettings(_ settings: Wallpaper.WallpaperUserSettings) async throws
+}

@@ -4,7 +4,7 @@ import WallpaperTypes
 
 /// Type-safe bridge to the private framework used by the macOS Wallpaper pane.
 /// The local interface files expose only the ABI surface Livecore needs.
-@available(macOS 26.0, *)
+@available(macOS 14.0, *)
 @MainActor
 enum PrivateWallpaperSettings {
     private struct BackupEnvelope: Codable {

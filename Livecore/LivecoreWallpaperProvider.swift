@@ -1,7 +1,10 @@
 import AppKit
 import AVFoundation
+import CoreImage
 import Darwin
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 
 enum LivecoreProviderError: LocalizedError {
     case wallpaperStoreUnavailable
@@ -36,7 +39,7 @@ enum LivecoreProviderError: LocalizedError {
         case .rollbackFailed(let detail):
             return "The wallpaper change failed and macOS could not confirm the rollback. Livecore kept the video files so the screen cannot go black. \(detail)"
         case .unsupportedSystem:
-            return "Livecore Lock Screen wallpapers require macOS 26 or later."
+            return "Livecore Lock Screen wallpapers require macOS 14.0 or later."
         }
     }
 
@@ -156,7 +159,7 @@ final class LivecoreWallpaperLibrary: @unchecked Sendable {
     }
 
     private let fileManager = FileManager.default
-    private let queue = DispatchQueue(label: "com.berkegulacar.Livecore.wallpaper-library", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "\(Bundle.main.bundleIdentifier ?? "com.livecore.app").wallpaper-library", qos: .default)
 
     var root: URL {
         let url = fileManager.homeDirectoryForCurrentUser
@@ -431,18 +434,19 @@ final class LivecoreWallpaperLibrary: @unchecked Sendable {
     }
 
     private func desktopImageData(at source: URL) -> Data? {
-        let cgImage: CGImage?
-        if let image = NSImage(contentsOf: source) {
-            cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        } else {
-            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: source))
-            generator.appliesPreferredTrackTransform = true
-            cgImage = try? generator.copyCGImage(at: .zero, actualTime: nil)
+        if let data = try? Data(contentsOf: source), !data.isEmpty {
+            return data
         }
-        guard let cgImage else { return nil }
-        return NSBitmapImageRep(cgImage: cgImage).representation(
-            using: .jpeg,
-            properties: [.compressionFactor: 0.9]
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: source))
+        generator.appliesPreferredTrackTransform = true
+        guard let cgImage = try? generator.copyCGImage(at: .zero, actualTime: nil) else { return nil }
+        let ciImage = CIImage(cgImage: cgImage)
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        let colorSpace = cgImage.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        return context.jpegRepresentation(
+            of: ciImage,
+            colorSpace: colorSpace,
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.9]
         )
     }
 
@@ -450,14 +454,20 @@ final class LivecoreWallpaperLibrary: @unchecked Sendable {
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: videoURL))
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = NSSize(width: 960, height: 540)
-        let image = try generator.copyCGImage(
+        let cgImage = try generator.copyCGImage(
             at: CMTime(seconds: 0.1, preferredTimescale: 600),
             actualTime: nil
         )
-        guard let data = NSBitmapImageRep(cgImage: image).representation(
-            using: .jpeg,
-            properties: [.compressionFactor: 0.82]
-        ) else { throw CocoaError(.fileWriteUnknown) }
+        let ciImage = CIImage(cgImage: cgImage)
+        let context = CIContext(options: [.useSoftwareRenderer: false])
+        let colorSpace = cgImage.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        guard let data = context.jpegRepresentation(
+            of: ciImage,
+            colorSpace: colorSpace,
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.82]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
         try data.write(to: destination, options: .atomic)
     }
 }
@@ -514,7 +524,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
     }
 
     private let fileManager = FileManager.default
-    private let queue = DispatchQueue(label: "com.berkegulacar.Livecore.wallpaper-lifecycle", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "\(Bundle.main.bundleIdentifier ?? "com.livecore.app").wallpaper-lifecycle", qos: .default)
     private let mutationGate = WallpaperMutationGate()
 
     static var providerID: String { LivecoreWallpaperLibrary.extensionBundleID }
@@ -558,7 +568,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
     func refreshWallpaperSettings() { notifyWallpaperChanged() }
 
     func installPlugin() async throws {
-        guard #available(macOS 26, *) else { throw LivecoreProviderError.unsupportedSystem }
+        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
         try queue.sync {
             let extensionURL = embeddedExtensionURL
             guard fileManager.fileExists(atPath: extensionURL.path) else {
@@ -596,15 +606,13 @@ final class WallpaperStoreManager: @unchecked Sendable {
                 "PluginKit did not enable the extension embedded in this app build."
             )
         }
-        do {
-            try await refreshWallpaperSettingsModel(attempts: 2)
-        } catch {
-            // Xcode can overwrite an appex at the same path while WallpaperAgent
-            // keeps the prior Mach-O mapped. Toggling PluginKit's election is a
-            // graceful lifecycle reset: it detaches the stale process without
-            // sending signals or terminating unrelated wallpaper services.
-            try await recyclePluginRegistration()
-            try await refreshWallpaperSettingsModel(attempts: 5)
+        if LivecoreWallpaperLibrary.shared.currentItem() != nil {
+            do {
+                try await refreshWallpaperSettingsModel(attempts: 2)
+            } catch {
+                try await recyclePluginRegistration()
+                try await refreshWallpaperSettingsModel(attempts: 5)
+            }
         }
     }
 
@@ -613,7 +621,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
     }
 
     private func refreshWallpaperSettingsModel(attempts: Int) async throws {
-        guard #available(macOS 26, *) else { throw LivecoreProviderError.unsupportedSystem }
+        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
         guard isPluginInstalled() else { throw LivecoreProviderError.pluginNotInstalled }
         guard let item = LivecoreWallpaperLibrary.shared.currentItem(),
               LivecoreWallpaperLibrary.shared.itemIsUsable(item)
@@ -719,7 +727,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
     }
 
     func activateLockScreen(item: LivecoreWallpaperItem) async throws {
-        guard #available(macOS 26, *) else { throw LivecoreProviderError.unsupportedSystem }
+        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
         await mutationGate.enter()
         do {
             guard isPluginInstalled() else { throw LivecoreProviderError.pluginNotInstalled }
@@ -787,7 +795,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
     }
 
     func deactivateLockScreen() async throws {
-        guard #available(macOS 26, *) else { throw LivecoreProviderError.unsupportedSystem }
+        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
         await mutationGate.enter()
         do {
             try await deactivateLockScreenLocked()
@@ -799,7 +807,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
     }
 
     private func deactivateLockScreenLocked() async throws {
-        guard #available(macOS 26, *) else { throw LivecoreProviderError.unsupportedSystem }
+        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
         let backupURL = LivecoreWallpaperLibrary.shared.lockScreenBackupURL
         let backup = try? Data(contentsOf: backupURL)
         let hadManagedSelection = (try? await PrivateWallpaperSettings.hasAnyProvider(Self.knownProviderIDs)) == true
@@ -874,7 +882,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
         return nil
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 14.0, *)
     private func waitForStableSelection(_ itemID: UUID, timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         var stableReads = 0
@@ -921,7 +929,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
         return false
     }
 
-    @available(macOS 26.0, *)
+    @available(macOS 14.0, *)
     private func waitForNoLivecoreSelection(timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         var stableReads = 0

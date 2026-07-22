@@ -445,7 +445,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             scaleItem.target = self
             scaleMenu.addItem(scaleItem)
         }
-        let scaleRoot = NSMenuItem(title: "Appearance", action: nil, keyEquivalent: "")
+        let scaleRoot = NSMenuItem(title: "Type & Scale", action: nil, keyEquivalent: "")
         scaleRoot.submenu = scaleMenu
         menu.addItem(scaleRoot)
         menu.addItem(.separator())

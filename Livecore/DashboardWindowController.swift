@@ -16,6 +16,8 @@ final class DashboardWindowController: NSWindowController {
     private let loginSwitch = NSSwitch()
     private var selectedURL: URL?
     private var previewSecurityScopedURL: URL?
+    private var queuePlayer: AVQueuePlayer?
+    private var playerLooper: AVPlayerLooper?
     private var isBusy = false
     private var needsLockScreenApply = true
     private var stateObservers: [NSObjectProtocol] = []
@@ -81,7 +83,7 @@ final class DashboardWindowController: NSWindowController {
         ])
 
         preview.videoGravity = .resizeAspectFill
-        preview.controlsStyle = .floating
+        preview.controlsStyle = .none
         preview.wantsLayer = true
         preview.layer?.cornerRadius = 18
         preview.layer?.masksToBounds = true
@@ -140,8 +142,7 @@ final class DashboardWindowController: NSWindowController {
         scaleControl.action = #selector(scaleChanged)
 
         let displayCard = card(
-            title: "Appearance",
-            subtitle: "Choose how the video fits the display",
+            title: "Type & Scale",
             content: NSStackView(views: [scaleControl, pathLabel])
         )
         (displayCard.subviews.last as? NSStackView)?.spacing = 12
@@ -157,21 +158,20 @@ final class DashboardWindowController: NSWindowController {
         loginRow.alignment = .centerY
         let startupCard = card(
             title: "Startup",
-            subtitle: "Keep Livecore ready in the menu bar",
             content: loginRow
         )
 
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
-        let stack = NSStackView(views: [
+        let stack: NSStackView = NSStackView(views: [
             preview,
             videoButtons,
             displayCard,
             startupCard,
             statusLabel,
         ])
-        stack.orientation = .vertical
-        stack.alignment = .leading
+        stack.orientation = NSUserInterfaceLayoutOrientation.vertical
+        stack.alignment = NSLayoutConstraint.Attribute.leading
         stack.spacing = 14
         stack.translatesAutoresizingMaskIntoConstraints = false
         background.addSubview(stack)
@@ -192,7 +192,7 @@ final class DashboardWindowController: NSWindowController {
     func updateButtonStates() {
         let state = WallpaperStoreManager.shared.lockScreenState()
         let isInstalled = state.pluginInstalled
-        let supportsLockScreen = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 26
+        let supportsLockScreen = ProcessInfo.processInfo.operatingSystemVersion.majorVersion >= 14
         let hasVideo = selectedURL != nil
         let isDesktopActive = WallpaperEngine.shared.isActive || settings.desktopEnabled
         chooseButton?.isEnabled = !isBusy
@@ -204,9 +204,7 @@ final class DashboardWindowController: NSWindowController {
             && supportsLockScreen
             && hasVideo
             && (needsLockScreenApply || !state.isHealthy)
-        pluginButton?.isEnabled = !isBusy
-            && supportsLockScreen
-            && (isInstalled || hasVideo || LivecoreWallpaperLibrary.shared.currentItem() != nil)
+        pluginButton?.isEnabled = !isBusy && supportsLockScreen
 
         if state.isHealthy && !needsLockScreenApply {
             lockScreenButton?.title = "Applied to Lock Screen"
@@ -228,7 +226,7 @@ final class DashboardWindowController: NSWindowController {
         }
     }
 
-    private func card(title: String, subtitle: String, content: NSView) -> NSView {
+    private func card(title: String, subtitle: String = "", content: NSView) -> NSView {
         let visual = NSVisualEffectView()
         visual.material = .hudWindow
         visual.state = .active
@@ -237,13 +235,19 @@ final class DashboardWindowController: NSWindowController {
 
         let heading = NSTextField(labelWithString: title)
         heading.font = .systemFont(ofSize: 14, weight: .semibold)
-        let detail = NSTextField(wrappingLabelWithString: subtitle)
-        detail.textColor = .secondaryLabelColor
-        detail.font = .systemFont(ofSize: 11)
 
-        let stack = NSStackView(views: [heading, detail, content])
-        stack.orientation = .vertical
-        stack.alignment = .leading
+        var subviews: [NSView] = [heading]
+        if !subtitle.isEmpty {
+            let detail = NSTextField(wrappingLabelWithString: subtitle)
+            detail.textColor = .secondaryLabelColor
+            detail.font = .systemFont(ofSize: 11)
+            subviews.append(detail)
+        }
+        subviews.append(content)
+
+        let stack = NSStackView(views: subviews)
+        stack.orientation = NSUserInterfaceLayoutOrientation.vertical
+        stack.alignment = NSLayoutConstraint.Attribute.leading
         stack.spacing = 7
         stack.translatesAutoresizingMaskIntoConstraints = false
         visual.addSubview(stack)
@@ -307,13 +311,13 @@ final class DashboardWindowController: NSWindowController {
         if let item = LivecoreWallpaperLibrary.shared.currentItem(),
            LivecoreWallpaperLibrary.shared.itemIsUsable(item) {
             setBusy(true)
-            setStatus("Refreshing Livecore in Wallpaper Settings…")
+            setStatus("Rendering…")
             Task {
                 do {
                     try await WallpaperStoreManager.shared.refreshWallpaperSettingsModel()
                     needsLockScreenApply = !WallpaperStoreManager.shared.lockScreenState().isHealthy
                     setBusy(false)
-                    setStatus("Video is available in Wallpaper Settings.")
+                    setStatus("Applied to Lock Screen.")
                 } catch {
                     needsLockScreenApply = true
                     setBusy(false)
@@ -326,8 +330,8 @@ final class DashboardWindowController: NSWindowController {
         let previousItem = LivecoreWallpaperLibrary.shared.currentItem()
         let previousState = WallpaperStoreManager.shared.lockScreenState()
         setBusy(true)
-        setStatus("Publishing the selected video to Wallpaper Settings…")
-        DispatchQueue.global(qos: .userInitiated).async {
+        setStatus("Rendering…")
+        DispatchQueue.global(qos: .default).async {
             [weak self, selectedURL, previousItem, previousState] in
             Task {
                 var preparedItem: LivecoreWallpaperItem?
@@ -342,7 +346,7 @@ final class DashboardWindowController: NSWindowController {
                     DispatchQueue.main.async {
                         self?.needsLockScreenApply = true
                         self?.setBusy(false)
-                        self?.setStatus("Video is available in Wallpaper Settings.")
+                        self?.setStatus("Applied to Lock Screen.")
                     }
                 } catch {
                     LivecoreWallpaperLibrary.shared.restore(
@@ -379,12 +383,17 @@ final class DashboardWindowController: NSWindowController {
     }
 
     private func showPreview(_ url: URL) {
-        preview.player?.pause()
+        playerLooper = nil
+        queuePlayer?.pause()
+        queuePlayer = nil
         previewSecurityScopedURL?.stopAccessingSecurityScopedResource()
         previewSecurityScopedURL = url.startAccessingSecurityScopedResource() ? url : nil
         pathLabel.stringValue = url.path
-        let player = AVPlayer(url: url)
+        let item = AVPlayerItem(url: url)
+        let player = AVQueuePlayer(playerItem: item)
         player.isMuted = true
+        playerLooper = AVPlayerLooper(player: player, templateItem: item)
+        queuePlayer = player
         preview.player = player
         player.play()
     }
@@ -432,7 +441,7 @@ final class DashboardWindowController: NSWindowController {
                 loginSwitch.state = .on
             }
 
-            setStatus("Video applied to Desktop.")
+            setStatus("Applied to Desktop.")
             updateButtonStates()
         } catch {
             setStatus(error.localizedDescription, error: true)
@@ -442,7 +451,7 @@ final class DashboardWindowController: NSWindowController {
     @objc private func stopDesktopWallpaper() {
         WallpaperEngine.shared.stop()
         settings.desktopEnabled = false
-        setStatus("Desktop playback stopped. The macOS wallpaper is visible again.")
+        setStatus("Desktop restored.")
         updateButtonStates()
     }
 
@@ -452,16 +461,16 @@ final class DashboardWindowController: NSWindowController {
             return
         }
         setBusy(true)
-        setStatus("Restoring the previous Lock Screen wallpaper…")
+        setStatus("Restoring Lock Screen...")
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        DispatchQueue.global(qos: .default).async { [weak self] in
             Task {
                 do {
                     try await WallpaperStoreManager.shared.deactivateLockScreen()
                     DispatchQueue.main.async {
                         self?.needsLockScreenApply = self?.selectedURL != nil
                         self?.setBusy(false)
-                        self?.setStatus("Lock Screen restored. Desktop was left unchanged.")
+                        self?.setStatus("Lock Screen restored.")
                     }
                 } catch {
                     DispatchQueue.main.async {
@@ -505,11 +514,11 @@ final class DashboardWindowController: NSWindowController {
         }
 
         setBusy(true)
-        setStatus("Preparing, selecting, and verifying the Lock Screen renderer…")
+        setStatus("Rendering…")
         let previousItem = LivecoreWallpaperLibrary.shared.currentItem()
         let previousState = WallpaperStoreManager.shared.lockScreenState()
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self, selectedURL, previousItem, previousState] in
+        DispatchQueue.global(qos: .default).async { [weak self, selectedURL, previousItem, previousState] in
             Task {
                 var preparedItem: LivecoreWallpaperItem?
                 do {
@@ -525,7 +534,7 @@ final class DashboardWindowController: NSWindowController {
                     DispatchQueue.main.async {
                         self?.needsLockScreenApply = false
                         self?.setBusy(false)
-                        self?.setStatus("Lock Screen renderer verified. Desktop remains visually unchanged.")
+                        self?.setStatus("Applied to Lock Screen.")
                     }
                 } catch {
                     let mustPreserve = (error as? LivecoreProviderError)?.mustPreservePublishedItem == true
@@ -555,14 +564,14 @@ final class DashboardWindowController: NSWindowController {
 
         if isInstalled {
             setStatus("Removing Livecore extension…")
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            DispatchQueue.global(qos: .default).async { [weak self] in
                 Task {
                     do {
                         try await WallpaperStoreManager.shared.uninstallPlugin()
                         DispatchQueue.main.async {
                             self?.needsLockScreenApply = self?.selectedURL != nil
                             self?.setBusy(false)
-                            self?.setStatus("Extension removed; the previous Lock Screen wallpaper was restored.")
+                            self?.setStatus("Extension removed.")
                         }
                     } catch {
                         DispatchQueue.main.async {
@@ -573,16 +582,11 @@ final class DashboardWindowController: NSWindowController {
                 }
             }
         } else {
-            guard selectedURL != nil || LivecoreWallpaperLibrary.shared.currentItem() != nil else {
-                setBusy(false)
-                setStatus("Choose a video before installing the extension.", error: true)
-                return
-            }
             setStatus("Installing Livecore extension…")
             let sourceURL = selectedURL
             let previousItem = LivecoreWallpaperLibrary.shared.currentItem()
             let previousState = WallpaperStoreManager.shared.lockScreenState()
-            DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.global(qos: .default).async {
                 [weak self, sourceURL, previousItem, previousState] in
                 Task {
                     var preparedItem: LivecoreWallpaperItem?
@@ -601,7 +605,7 @@ final class DashboardWindowController: NSWindowController {
                         DispatchQueue.main.async {
                             self?.needsLockScreenApply = true
                             self?.setBusy(false)
-                            self?.setStatus("Extension installed; the video is available in Wallpaper Settings.")
+                            self?.setStatus("Extension installed.")
                         }
                     } catch {
                         LivecoreWallpaperLibrary.shared.restore(

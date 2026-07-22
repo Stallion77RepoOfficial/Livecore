@@ -101,7 +101,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     override init() {
         super.init()
         assetObserver = DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("com.berkegulacar.Livecore.assets-changed"),
+            forName: NSNotification.Name("com.livecore.app.assets-changed"),
             object: nil,
             queue: nil
         ) { [weak self] _ in self?.pushSettings() }
@@ -294,7 +294,7 @@ private final class LivecoreRemoteRenderer: @unchecked Sendable {
 
     private var sessions: [SurfaceKey: RenderSession] = [:]
     private var invalidationTokens: [SurfaceKey: UUID] = [:]
-    private let queue = DispatchQueue(label: "com.berkegulacar.Livecore.extension-lifecycle", qos: .userInitiated)
+    private let queue = DispatchQueue(label: "\(Bundle.main.bundleIdentifier ?? "com.livecore.app").extension-lifecycle", qos: .default)
 
     private init() {
         DistributedNotificationCenter.default().addObserver(
@@ -463,7 +463,7 @@ private final class SampleBufferPump: @unchecked Sendable {
     private let timebase: CMTimebase
     private let asset: AVURLAsset
     private let stillBuffer: CMSampleBuffer
-    private let decodeQueue = DispatchQueue(label: "com.berkegulacar.Livecore.video-decoder", qos: .userInitiated)
+    private let decodeQueue = DispatchQueue(label: "\(Bundle.main.bundleIdentifier ?? "com.livecore.app").video-decoder", qos: .default)
     private let stateLock = NSLock()
     private let renderLock = NSLock()
     private var token: UUID?

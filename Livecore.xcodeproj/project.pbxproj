@@ -14,6 +14,7 @@
 		61325E2F7D28545D827D56E0 /* LivecoreWallpaperProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 703B1D981D2C608069E65CE6 /* LivecoreWallpaperProvider.swift */; };
 		704471F0C0B357A17C096F9A /* LivecoreWallpaperExtension.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 255316117574CB68DA99F8B0 /* LivecoreWallpaperExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		DAED500484ACE99CE0DC1A69 /* DashboardWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67787413D04C910763363708 /* DashboardWindowController.swift */; };
+		AA1122334455667788990011 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BB1122334455667788990022 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -54,6 +55,7 @@
 		A9B6C00874619E0FC7C5F1B4 /* PrivateWallpaperSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PrivateWallpaperSettings.swift; sourceTree = "<group>"; };
 		DDF1C44BA78129E3D1411028 /* LivecoreWallpaperExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = LivecoreWallpaperExtension.entitlements; sourceTree = "<group>"; };
 		E4DA6FC9CE599655B91907D7 /* Livecore.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Livecore.entitlements; sourceTree = "<group>"; };
+		BB1122334455667788990022 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -96,6 +98,7 @@
 				703B1D981D2C608069E65CE6 /* LivecoreWallpaperProvider.swift */,
 				8D422873AE4BA492CA54811D /* main.swift */,
 				A9B6C00874619E0FC7C5F1B4 /* PrivateWallpaperSettings.swift */,
+				BB1122334455667788990022 /* Assets.xcassets */,
 			);
 			path = Livecore;
 			sourceTree = "<group>";
@@ -184,6 +187,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA1122334455667788990011 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -225,6 +229,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
+				ARCHS = arm64;
 				CODE_SIGN_ENTITLEMENTS = LivecoreWallpaperExtension/LivecoreWallpaperExtension.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
@@ -282,7 +287,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = 345USFAYPB;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -317,7 +322,10 @@
 		56182F68A10071BB6FD78956 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
 				CODE_SIGN_ENTITLEMENTS = Livecore/Livecore.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;
@@ -349,7 +357,10 @@
 		6018C420A613FD2A4F5EB120 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ARCHS = arm64;
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GENERATE_ASSET_SYMBOLS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = NO;
 				CODE_SIGN_ENTITLEMENTS = Livecore/Livecore.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
@@ -383,6 +394,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
+				ARCHS = arm64;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
@@ -416,7 +428,7 @@
 				COPY_PHASE_STRIP = NO;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = 345USFAYPB;
+				DEVELOPMENT_TEAM = "";
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -445,6 +457,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				APPLICATION_EXTENSION_API_ONLY = YES;
+				ARCHS = arm64;
 				CODE_SIGN_ENTITLEMENTS = LivecoreWallpaperExtension/LivecoreWallpaperExtension.entitlements;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Manual;

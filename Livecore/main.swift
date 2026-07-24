@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import IOKit.pwr_mgt
 import ServiceManagement
 
 enum VideoScaleType: String, CaseIterable {
@@ -25,6 +26,7 @@ final class AppSettings {
         static let videoBookmark = "videoBookmark"
         static let scaleType = "scaleType"
         static let desktopEnabled = "desktopEnabled"
+        static let keepScreenAwakeOnLock = "keepScreenAwakeOnLock"
     }
 
     private let defaults = UserDefaults.standard
@@ -41,6 +43,11 @@ final class AppSettings {
     var desktopEnabled: Bool {
         get { defaults.bool(forKey: Key.desktopEnabled) }
         set { defaults.set(newValue, forKey: Key.desktopEnabled) }
+    }
+
+    var keepScreenAwakeOnLock: Bool {
+        get { defaults.bool(forKey: Key.keepScreenAwakeOnLock) }
+        set { defaults.set(newValue, forKey: Key.keepScreenAwakeOnLock) }
     }
 
     func saveVideoURL(_ url: URL) throws {
@@ -385,13 +392,51 @@ final class WallpaperEngine: @unchecked Sendable {
     }
 }
 
+final class PowerAssertionManager: @unchecked Sendable {
+    static let shared = PowerAssertionManager()
+    private var assertionID: IOPMAssertionID = 0
+    private var isAsserting = false
+
+    func updateAssertionState() {
+        let shouldKeepAwake = AppSettings.shared.keepScreenAwakeOnLock
+        if shouldKeepAwake {
+            createAssertion()
+        } else {
+            releaseAssertion()
+        }
+    }
+
+    private func createAssertion() {
+        guard !isAsserting else { return }
+        let reason = "Livecore Keep Screen Awake on Lock" as CFString
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            reason,
+            &assertionID
+        )
+        if result == kIOReturnSuccess {
+            isAsserting = true
+        }
+    }
+
+    private func releaseAssertion() {
+        guard isAsserting else { return }
+        IOPMAssertionRelease(assertionID)
+        assertionID = 0
+        isAsserting = false
+    }
+}
+
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var settingsWindowController: DashboardWindowController?
     private var statusItem: NSStatusItem?
+    private var keepAwakeMenuItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        PowerAssertionManager.shared.updateAssertionState()
         installStatusMenu()
 
         let settings = AppSettings.shared
@@ -429,6 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         let menu = NSMenu()
+        menu.delegate = self
         menu.addItem(NSMenuItem(title: "Open App", action: #selector(showSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Play on Desktop", action: #selector(playSavedVideo), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Stop Desktop Playback", action: #selector(stopPlayback), keyEquivalent: ""))
@@ -448,12 +494,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let scaleRoot = NSMenuItem(title: "Type & Scale", action: nil, keyEquivalent: "")
         scaleRoot.submenu = scaleMenu
         menu.addItem(scaleRoot)
+
+        let awakeItem = NSMenuItem(
+            title: "Keep Screen Awake on Lock",
+            action: #selector(toggleKeepScreenAwake(_:)),
+            keyEquivalent: ""
+        )
+        awakeItem.state = AppSettings.shared.keepScreenAwakeOnLock ? .on : .off
+        menu.addItem(awakeItem)
+        keepAwakeMenuItem = awakeItem
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Livecore", action: #selector(quit), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
 
         item.menu = menu
         statusItem = item
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        updateKeepAwakeMenuItemState()
+    }
+
+    func updateKeepAwakeMenuItemState() {
+        keepAwakeMenuItem?.state = AppSettings.shared.keepScreenAwakeOnLock ? .on : .off
+    }
+
+    @objc private func toggleKeepScreenAwake(_ sender: NSMenuItem) {
+        AppSettings.shared.keepScreenAwakeOnLock.toggle()
+        PowerAssertionManager.shared.updateAssertionState()
+        updateKeepAwakeMenuItemState()
+        settingsWindowController?.updateKeepAwakeSwitchState()
     }
 
     @objc private func showSettings() {

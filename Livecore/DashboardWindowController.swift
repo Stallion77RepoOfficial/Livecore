@@ -14,6 +14,7 @@ final class DashboardWindowController: NSWindowController {
         action: nil
     )
     private let loginSwitch = NSSwitch()
+    private let keepAwakeSwitch = NSSwitch()
     private var selectedURL: URL?
     private var previewSecurityScopedURL: URL?
     private var queuePlayer: AVQueuePlayer?
@@ -156,9 +157,28 @@ final class DashboardWindowController: NSWindowController {
         ])
         loginRow.orientation = .horizontal
         loginRow.alignment = .centerY
+
+        keepAwakeSwitch.target = self
+        keepAwakeSwitch.action = #selector(keepAwakeChanged)
+        let keepAwakeRow = NSStackView(views: [
+            NSTextField(labelWithString: "Keep display awake on Lock Screen"),
+            NSView(),
+            keepAwakeSwitch,
+        ])
+        keepAwakeRow.orientation = .horizontal
+        keepAwakeRow.alignment = .centerY
+
+        let startupStack = NSStackView(views: [loginRow, keepAwakeRow])
+        startupStack.orientation = .vertical
+        startupStack.alignment = .leading
+        startupStack.spacing = 10
+
+        loginRow.widthAnchor.constraint(equalTo: startupStack.widthAnchor).isActive = true
+        keepAwakeRow.widthAnchor.constraint(equalTo: startupStack.widthAnchor).isActive = true
+
         let startupCard = card(
-            title: "Startup",
-            content: loginRow
+            title: "Startup & Power",
+            content: startupStack
         )
 
         statusLabel.textColor = .secondaryLabelColor
@@ -287,6 +307,7 @@ final class DashboardWindowController: NSWindowController {
         if #available(macOS 13, *) {
             loginSwitch.state = LoginItemManager.shared.isEnabled ? .on : .off
         }
+        keepAwakeSwitch.state = settings.keepScreenAwakeOnLock ? .on : .off
 
         do {
             selectedURL = try settings.resolveVideoURL()
@@ -486,6 +507,10 @@ final class DashboardWindowController: NSWindowController {
         settings.scaleType = VideoScaleType.allCases[scaleControl.selectedSegment]
     }
 
+    func updateKeepAwakeSwitchState() {
+        keepAwakeSwitch.state = settings.keepScreenAwakeOnLock ? .on : .off
+    }
+
     @objc private func loginChanged() {
         guard #available(macOS 13, *) else {
             return
@@ -496,6 +521,12 @@ final class DashboardWindowController: NSWindowController {
             loginSwitch.state = LoginItemManager.shared.isEnabled ? .on : .off
             setStatus(error.localizedDescription, error: true)
         }
+    }
+
+    @objc private func keepAwakeChanged() {
+        settings.keepScreenAwakeOnLock = (keepAwakeSwitch.state == .on)
+        PowerAssertionManager.shared.updateAssertionState()
+        (NSApp.delegate as? AppDelegate)?.updateKeepAwakeMenuItemState()
     }
 
     @objc private func applyToLockScreen() {

@@ -289,6 +289,27 @@ private struct RequestDestination {
     let displayID: UInt32
 }
 
+/// Latched lock-screen state. WallpaperAgent keeps sending presentation-mode
+/// and activity updates while the screen stays locked (for example when the
+/// user idles with a display-sleep assertion held); relying on those updates
+/// alone downgrades the renderer to a frozen still.
+private enum ScreenLockState {
+    private static let lock = NSLock()
+    private static var locked = false
+
+    static var isLocked: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return locked
+    }
+
+    static func set(_ value: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        locked = value
+    }
+}
+
 private final class LivecoreRemoteRenderer: @unchecked Sendable {
     static let shared = LivecoreRemoteRenderer()
 
@@ -301,12 +322,18 @@ private final class LivecoreRemoteRenderer: @unchecked Sendable {
             forName: NSNotification.Name("com.apple.screenIsLocked"),
             object: nil,
             queue: nil
-        ) { [weak self] _ in self?.updateAll(presentationMode: "locked", activityState: "active") }
+        ) { [weak self] _ in
+            ScreenLockState.set(true)
+            self?.updateAll(presentationMode: "locked", activityState: "active")
+        }
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("com.apple.screenIsUnlocked"),
             object: nil,
             queue: nil
-        ) { [weak self] _ in self?.updateAll(presentationMode: "default", activityState: "active") }
+        ) { [weak self] _ in
+            ScreenLockState.set(false)
+            self?.updateAll(presentationMode: "default", activityState: "active")
+        }
     }
 
     func acquire(
@@ -441,9 +468,14 @@ private final class RenderSession {
 
     func update(presentationMode: String, activityState: String) {
         guard !invalidated else { return }
+        if presentationMode == "locked" { ScreenLockState.set(true) }
+        // While the screen is locked, keep playing even if WallpaperAgent
+        // reports an idle activity state or reverts the presentation mode;
+        // otherwise the wallpaper degrades to a still after a few minutes.
         let shouldPlay = SharedWallpaperLibrary.playbackEnabled()
-            && activityState == "active"
-            && (isPreview || presentationMode == "locked")
+            && (isPreview
+                ? activityState == "active"
+                : presentationMode == "locked" || ScreenLockState.isLocked)
         if shouldPlay { pump.play() } else { pump.showStill() }
     }
 
@@ -539,8 +571,14 @@ private final class SampleBufferPump: @unchecked Sendable {
                 self.finishAttempt(attemptToken, generation: generation, retry: true)
                 return
             }
+            let trackDuration = (try? await track.load(.timeRange))?.duration ?? .invalid
             self.decodeQueue.async { [weak self] in
-                self?.decodeLoop(track: track, token: attemptToken, generation: generation)
+                self?.decodeLoop(
+                    track: track,
+                    trackDuration: trackDuration,
+                    token: attemptToken,
+                    generation: generation
+                )
             }
         }
     }
@@ -626,7 +664,12 @@ private final class SampleBufferPump: @unchecked Sendable {
         }
     }
 
-    private func decodeLoop(track: AVAssetTrack, token: UUID, generation: UInt64) {
+    private func decodeLoop(
+        track: AVAssetTrack,
+        trackDuration: CMTime,
+        token: UUID,
+        generation: UInt64
+    ) {
         defer { finishAttempt(token, generation: generation, retry: true) }
         var loopOffset = CMTime.zero
         while isCurrent(token) {
@@ -643,6 +686,24 @@ private final class SampleBufferPump: @unchecked Sendable {
             var firstPTS: CMTime?
             var lastEnd = loopOffset
             while isCurrent(token), reader.status == .reading {
+                // The system renderer can silently enter a failed state (for
+                // example across display power transitions); enqueue then
+                // becomes a no-op and the wallpaper freezes. A failed status
+                // aborts the attempt so the retry path restarts playback.
+                // requiresFlushToResumeDecoding also fires on benign decoder
+                // discontinuities (such as the loop boundary); recover with an
+                // in-place flush instead of aborting, otherwise the loop never
+                // restarts and the wallpaper stays frozen on the last frame.
+                if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
+                    renderLock.lock()
+                    renderer.flush()
+                    renderLock.unlock()
+                    if renderer.status == .failed {
+                        reader.cancelReading()
+                        return
+                    }
+                    continue
+                }
                 guard renderer.isReadyForMoreMediaData else {
                     Thread.sleep(forTimeInterval: 0.004)
                     continue
@@ -653,14 +714,31 @@ private final class SampleBufferPump: @unchecked Sendable {
                 }
                 notePlaybackProgress(token)
                 let samplePTS = CMSampleBufferGetPresentationTimeStamp(sample)
-                if firstPTS == nil { firstPTS = samplePTS }
+                if firstPTS == nil, samplePTS.isNumeric {
+                    // Base the loop shift on the earliest timestamp of the
+                    // pass. The first decode timestamp is usually earlier than
+                    // the presentation timestamp; shifting by PTS alone sends
+                    // the decode timeline backwards at the loop boundary,
+                    // which trips the decoder's discontinuity handling.
+                    let sampleDTS = CMSampleBufferGetDecodeTimeStamp(sample)
+                    firstPTS = sampleDTS.isNumeric
+                        ? CMTimeMinimum(samplePTS, sampleDTS)
+                        : samplePTS
+                }
                 let shift = CMTimeSubtract(loopOffset, firstPTS ?? .zero)
                 let adjusted = retime(sample, by: shift) ?? sample
                 let pts = CMSampleBufferGetPresentationTimeStamp(adjusted)
-                let duration = CMSampleBufferGetDuration(adjusted).isValid
+                let duration = CMSampleBufferGetDuration(adjusted).isNumeric
                     ? CMSampleBufferGetDuration(adjusted)
                     : CMTime(value: 1, timescale: 30)
-                lastEnd = CMTimeMaximum(lastEnd, CMTimeAdd(pts, duration))
+                // A sample with a non-numeric timestamp (the trailing sample of
+                // a pass can carry one) must neither advance lastEnd nor reach
+                // the renderer: CMTimeMaximum propagates invalid times, and one
+                // poisoned loopOffset turns every following pass into a no-op,
+                // freezing the wallpaper on the last decoded frame.
+                guard pts.isNumeric else { continue }
+                let end = CMTimeAdd(pts, duration)
+                if end.isNumeric { lastEnd = CMTimeMaximum(lastEnd, end) }
 
                 renderLock.lock()
                 if isCurrent(token) { renderer.enqueue(adjusted) }
@@ -668,7 +746,15 @@ private final class SampleBufferPump: @unchecked Sendable {
             }
             reader.cancelReading()
             if !isCurrent(token) { break }
-            loopOffset = lastEnd
+            if lastEnd.isNumeric, CMTimeCompare(lastEnd, loopOffset) > 0 {
+                loopOffset = lastEnd
+            } else if trackDuration.isNumeric, CMTimeCompare(trackDuration, .zero) > 0 {
+                loopOffset = CMTimeAdd(loopOffset, trackDuration)
+            } else {
+                // No trustworthy way to advance the timeline; restart playback
+                // from scratch via the retry path instead of spinning.
+                break
+            }
             if reader.status == .failed || reader.status == .cancelled { break }
         }
     }

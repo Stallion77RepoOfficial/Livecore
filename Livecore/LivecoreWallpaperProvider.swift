@@ -95,7 +95,7 @@ private struct DesktopImageSource {
 
 final class LivecoreWallpaperLibrary: @unchecked Sendable {
     static let shared = LivecoreWallpaperLibrary()
-    static let releaseExtensionBundleID = "com.berkegulacar.Livecore.wallpaper-extension"
+    static let releaseExtensionBundleID = "com.livecore.app.wallpaper-extension"
 
     static var extensionBundleID: String {
         let extensionURL = Bundle.main.bundleURL
@@ -528,8 +528,17 @@ final class WallpaperStoreManager: @unchecked Sendable {
     private let mutationGate = WallpaperMutationGate()
 
     static var providerID: String { LivecoreWallpaperLibrary.extensionBundleID }
+    /// Bundle identifiers used by earlier releases. The wallpaper store may
+    /// still select one of these after an upgrade; without recognizing them the
+    /// stale selection is treated as the user's own wallpaper, gets captured as
+    /// the restore point, and every failed activation rolls back to a provider
+    /// that no longer exists — leaving the Lock Screen unrecoverable.
+    private static let legacyProviderIDs: Set<String> = [
+        "com.berkegulacar.Livecore.wallpaper-extension",
+        "com.berkegulacar.Livecore.wallpaper-extension.debug",
+    ]
     private static var knownProviderIDs: Set<String> {
-        [providerID, LivecoreWallpaperLibrary.releaseExtensionBundleID]
+        legacyProviderIDs.union([providerID, LivecoreWallpaperLibrary.releaseExtensionBundleID])
     }
 
     private var storeURL: URL {
@@ -1004,7 +1013,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
             deliverImmediately: true
         )
         DistributedNotificationCenter.default().postNotificationName(
-            NSNotification.Name("com.berkegulacar.Livecore.assets-changed"),
+            NSNotification.Name("com.livecore.app.assets-changed"),
             object: nil,
             userInfo: nil,
             deliverImmediately: true
@@ -1019,7 +1028,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
         )
         CFNotificationCenterPostNotification(
             darwinCenter,
-            CFNotificationName("com.berkegulacar.Livecore.assets-changed" as CFString),
+            CFNotificationName("com.livecore.app.assets-changed" as CFString),
             nil,
             nil,
             true

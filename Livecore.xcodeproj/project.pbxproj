@@ -31,8 +31,8 @@
 		E63D0135465282948CA094D0 /* Embed ExtensionKit Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
-			dstPath = "$(EXTENSIONS_FOLDER_PATH)";
-			dstSubfolderSpec = 16;
+			dstPath = "Contents/Extensions";
+			dstSubfolderSpec = 1;
 			files = (
 				704471F0C0B357A17C096F9A /* LivecoreWallpaperExtension.appex in Embed ExtensionKit Extensions */,
 			);
@@ -243,7 +243,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.berkegulacar.Livecore.wallpaper-extension";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.livecore.app.wallpaper-extension";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = LivecoreWallpaperExtension/RuntimeBridge.h;
@@ -348,7 +348,7 @@
 					"-framework",
 					WallpaperTypes,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.berkegulacar.Livecore;
+				PRODUCT_BUNDLE_IDENTIFIER = com.livecore.app;
 				SDKROOT = macosx;
 				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/PrivateModules";
 			};
@@ -384,7 +384,7 @@
 					"-framework",
 					WallpaperTypes,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.berkegulacar.Livecore;
+				PRODUCT_BUNDLE_IDENTIFIER = com.livecore.app;
 				SDKROOT = macosx;
 				SWIFT_INCLUDE_PATHS = "$(SRCROOT)/PrivateModules";
 			};
@@ -470,7 +470,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.berkegulacar.Livecore.wallpaper-extension.debug";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.livecore.app.wallpaper-extension.debug";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = LivecoreWallpaperExtension/RuntimeBridge.h;

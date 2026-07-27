@@ -317,9 +317,15 @@ final class DesktopBackdropManager {
         var capturedNewSnapshot = false
 
         for screen in NSScreen.screens {
+            let currentURL = workspace.desktopImageURL(for: screen)
+            // A Livecore extension URL means macOS currently owns the Lock
+            // Screen selection. Writing through NSWorkspace here would replace
+            // that private selection and make the Lock Screen silently fall
+            // back later.
+            guard !Self.isExtensionWallpaper(currentURL) else { continue }
             let displayID = Self.displayID(for: screen)
             if snapshots[displayID] == nil,
-               let imageURL = workspace.desktopImageURL(for: screen) {
+               let imageURL = currentURL {
                 let options = workspace.desktopImageOptions(for: screen) ?? [:]
                 let archive = try NSKeyedArchiver.archivedData(
                     withRootObject: options,
@@ -342,6 +348,10 @@ final class DesktopBackdropManager {
 
         do {
             for screen in NSScreen.screens {
+                let currentURL = workspace.desktopImageURL(for: screen)
+                guard !Self.isExtensionWallpaper(currentURL),
+                      currentURL?.standardizedFileURL != posterURL.standardizedFileURL
+                else { continue }
                 try workspace.setDesktopImageURL(
                     posterURL,
                     for: screen,
@@ -361,7 +371,14 @@ final class DesktopBackdropManager {
         }
 
         var failed = false
+        var deferred = false
         for screen in NSScreen.screens {
+            if Self.isExtensionWallpaper(workspace.desktopImageURL(for: screen)) {
+                // Keep the restore point until the Lock Screen selection is
+                // removed. Restoring now would remove that selection.
+                deferred = true
+                continue
+            }
             let displayID = Self.displayID(for: screen)
             guard let snapshot = snapshots[displayID] else { continue }
             let options = (try? NSKeyedUnarchiver.unarchivedObject(
@@ -379,7 +396,7 @@ final class DesktopBackdropManager {
             }
         }
 
-        guard !failed else { return }
+        guard !failed, !deferred else { return }
         snapshots.removeAll()
         defaults.removeObject(forKey: Self.snapshotsKey)
         removePoster()
@@ -428,6 +445,10 @@ final class DesktopBackdropManager {
     private static func displayID(for screen: NSScreen) -> UInt32 {
         (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
             .uint32Value ?? 0
+    }
+
+    private static func isExtensionWallpaper(_ url: URL?) -> Bool {
+        url?.path.contains("/\(LivecoreLibraryFile.directoryName)/") == true
     }
 
     private static func options(
@@ -614,6 +635,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             Task {
                 do {
                     try await WallpaperStoreManager.shared.resetForNewInstallation()
+                    DesktopBackdropManager.shared.restore()
                     AppSettings.shared.completeInstallationCleanup()
                 } catch {
                     NSApp.presentError(error)

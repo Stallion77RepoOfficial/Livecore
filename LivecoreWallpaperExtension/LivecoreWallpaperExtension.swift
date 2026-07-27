@@ -825,13 +825,11 @@ private final class SampleBufferPump: @unchecked Sendable {
             return
         }
         token = nil
-        let shouldRetry = retry
-            && playbackRequested
-            && !stopped
-            && retryAttempt < 5
+        let shouldRetry = retry && playbackRequested && !stopped
         let delay = min(0.25 * pow(2, Double(retryAttempt)), 4)
-        if shouldRetry { retryAttempt += 1 }
-        let shouldFallBack = retry && playbackRequested && !stopped && !shouldRetry
+        if shouldRetry {
+            retryAttempt = min(retryAttempt + 1, 5)
+        }
         stateLock.unlock()
 
         if shouldRetry {
@@ -854,14 +852,6 @@ private final class SampleBufferPump: @unchecked Sendable {
                 self.token = retryToken
                 self.stateLock.unlock()
                 self.startAttempt(retryToken, generation: generation)
-            }
-        } else if shouldFallBack {
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.isGenerationCurrent(generation) else { return }
-                if rebuildRenderer {
-                    self.rebuildDisplayLayerIfFailed()
-                }
-                self.showStill()
             }
         }
     }
@@ -927,10 +917,14 @@ private final class SampleBufferPump: @unchecked Sendable {
             var firstPTS: CMTime?
             var lastEnd = loopOffset
             var rendererFailed = false
+            var rendererStalled = false
+            var lastProgress = Date()
             while isCurrent(token, generation: generation), reader.status == .reading {
                 renderLock.lock()
                 if renderer.requiresFlushToResumeDecoding {
                     renderer.flush()
+                    markDisplayImmediately(playbackPlaceholderBuffer)
+                    renderer.enqueue(playbackPlaceholderBuffer)
                 }
                 rendererFailed = renderer.status == .failed
                 let ready = renderer.isReadyForMoreMediaData
@@ -940,6 +934,10 @@ private final class SampleBufferPump: @unchecked Sendable {
                     break
                 }
                 guard ready else {
+                    if Date().timeIntervalSince(lastProgress) >= 2 {
+                        rendererStalled = true
+                        break
+                    }
                     Thread.sleep(forTimeInterval: 0.004)
                     continue
                 }
@@ -948,6 +946,7 @@ private final class SampleBufferPump: @unchecked Sendable {
                     continue
                 }
                 notePlaybackProgress(token, generation: generation)
+                lastProgress = Date()
                 let samplePTS = CMSampleBufferGetPresentationTimeStamp(sample)
                 if firstPTS == nil, samplePTS.isNumeric {
                     let sampleDTS = CMSampleBufferGetDecodeTimeStamp(sample)
@@ -974,6 +973,7 @@ private final class SampleBufferPump: @unchecked Sendable {
                 reader.cancelReading()
             }
             guard !rendererFailed,
+                  !rendererStalled,
                   isCurrent(token, generation: generation),
                   reader.status != .failed
             else { break }

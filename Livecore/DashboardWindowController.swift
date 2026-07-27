@@ -478,6 +478,15 @@ final class DashboardWindowController: NSWindowController {
     @objc private func stopLockScreenWallpaper() {
         perform("Restoring Lock Screen…", success: "Lock Screen restored.") {
             try await WallpaperStoreManager.shared.deactivateLockScreen()
+            await MainActor.run {
+                if WallpaperEngine.shared.isActive {
+                    try? DesktopBackdropManager.shared.apply(
+                        scaleType: AppSettings.shared.scaleType
+                    )
+                } else {
+                    DesktopBackdropManager.shared.restore()
+                }
+            }
         }
     }
 
@@ -485,6 +494,15 @@ final class DashboardWindowController: NSWindowController {
         if lockState?.extensionInstalled == true {
             perform("Removing Livecore extension…", success: "Extension removed.") {
                 try await WallpaperStoreManager.shared.uninstallExtension()
+                await MainActor.run {
+                    if WallpaperEngine.shared.isActive {
+                        try? DesktopBackdropManager.shared.apply(
+                            scaleType: AppSettings.shared.scaleType
+                        )
+                    } else {
+                        DesktopBackdropManager.shared.restore()
+                    }
+                }
             }
         } else {
             perform("Installing Livecore extension…", success: "Extension installed.") {

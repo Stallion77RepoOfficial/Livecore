@@ -423,9 +423,8 @@ private final class DistributedSignalWaiter: @unchecked Sendable {
 
 /// Installs the wallpaper extension and owns every Lock Screen mutation.
 ///
-/// Dashboard actions, quit teardown and fresh-install cleanup can overlap.
-/// They all pass through the same gate so a late rollback cannot undo a newer
-/// operation.
+/// Dashboard and fresh-install operations can overlap. They all pass through
+/// the same gate so a late rollback cannot undo a newer operation.
 final class WallpaperStoreManager: @unchecked Sendable {
     static let shared = WallpaperStoreManager()
 
@@ -578,21 +577,11 @@ final class WallpaperStoreManager: @unchecked Sendable {
 
     func uninstallExtension() async throws {
         try await withMutation {
-            try await self.deactivateLockScreenLocked()
-            for identifier in Self.knownProviderIDs {
-                _ = try? self.run("-e", "ignore", "-i", identifier)
-            }
-            guard await self.terminateExtensionProcesses() else {
-                throw LivecoreProviderError.pluginKitFailed(
-                    "The Livecore wallpaper extension process did not exit, so its assets were kept."
-                )
-            }
-            try self.removeStalePluginRecords(keepEmbeddedCurrent: true)
-            try self.purgeAllLibraries()
-            self.notifyAssetsChanged()
-            guard try !self.isExtensionInstalled() else {
-                throw LivecoreProviderError.pluginKitFailed("The extension stayed enabled.")
-            }
+            try await self.removeExtensionLocked(
+                processExitFailure:
+                    "The Livecore wallpaper extension process did not exit, so its assets were kept.",
+                enabledFailure: "The extension stayed enabled."
+            )
         }
     }
 
@@ -601,23 +590,30 @@ final class WallpaperStoreManager: @unchecked Sendable {
     /// containers behind, so all four are treated as uninstall state.
     func resetForNewInstallation() async throws {
         try await withMutation {
-            try await self.deactivateLockScreenLocked()
-            for identifier in Self.knownProviderIDs {
-                _ = try? self.run("-e", "ignore", "-i", identifier)
-            }
-            guard await self.terminateExtensionProcesses() else {
-                throw LivecoreProviderError.pluginKitFailed(
-                    "A previous Livecore wallpaper extension process did not exit, so its assets were kept."
-                )
-            }
-            try self.removeStalePluginRecords(keepEmbeddedCurrent: true)
-            try self.purgeAllLibraries()
-            self.notifyAssetsChanged()
-            guard try !self.isExtensionInstalled() else {
-                throw LivecoreProviderError.pluginKitFailed(
-                    "The previous extension election stayed enabled."
-                )
-            }
+            try await self.removeExtensionLocked(
+                processExitFailure:
+                    "A previous Livecore wallpaper extension process did not exit, so its assets were kept.",
+                enabledFailure: "The previous extension election stayed enabled."
+            )
+        }
+    }
+
+    private func removeExtensionLocked(
+        processExitFailure: String,
+        enabledFailure: String
+    ) async throws {
+        try await deactivateLockScreenLocked()
+        for identifier in Self.knownProviderIDs {
+            _ = try? run("-e", "ignore", "-i", identifier)
+        }
+        guard await terminateExtensionProcesses() else {
+            throw LivecoreProviderError.pluginKitFailed(processExitFailure)
+        }
+        try removeStalePluginRecords(keepEmbeddedCurrent: true)
+        try purgeAllLibraries()
+        notifyAssetsChanged()
+        guard try !isExtensionInstalled() else {
+            throw LivecoreProviderError.pluginKitFailed(enabledFailure)
         }
     }
 
@@ -958,19 +954,24 @@ final class WallpaperStoreManager: @unchecked Sendable {
     }
 
     private var backupURLs: [URL] {
-        let home = fileManager.homeDirectoryForCurrentUser
         var urls = [library.lockScreenBackupURL, library.legacyLockScreenBackupURL]
-        for identifier in Self.legacyProviderIDs {
-            let root = home
+        for root in legacyLibraryRoots {
+            urls.append(root.appendingPathComponent(LivecoreLibraryFile.lockScreenBackup))
+            urls.append(root.appendingPathComponent("lock-screen-backup.plist"))
+        }
+        return urls
+    }
+
+    private var legacyLibraryRoots: [URL] {
+        let home = fileManager.homeDirectoryForCurrentUser
+        return Self.legacyProviderIDs.map { identifier in
+            home
                 .appendingPathComponent(
                     "Library/Containers/\(identifier)/Data/Documents",
                     isDirectory: true
                 )
                 .appendingPathComponent(LivecoreLibraryFile.directoryName, isDirectory: true)
-            urls.append(root.appendingPathComponent(LivecoreLibraryFile.lockScreenBackup))
-            urls.append(root.appendingPathComponent("lock-screen-backup.plist"))
         }
-        return urls
     }
 
     private func backupDataCandidates() -> [Data] {
@@ -989,14 +990,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
     }
 
     private func purgeLegacyLibraries() throws {
-        let home = fileManager.homeDirectoryForCurrentUser
-        for identifier in Self.legacyProviderIDs {
-            let root = home
-                .appendingPathComponent(
-                    "Library/Containers/\(identifier)/Data/Documents",
-                    isDirectory: true
-                )
-                .appendingPathComponent(LivecoreLibraryFile.directoryName, isDirectory: true)
+        for root in legacyLibraryRoots {
             if fileManager.fileExists(atPath: root.path) {
                 try fileManager.removeItem(at: root)
             }

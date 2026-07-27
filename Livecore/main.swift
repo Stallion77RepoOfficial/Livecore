@@ -283,6 +283,181 @@ final class WallpaperSurface {
 }
 
 @MainActor
+final class DesktopBackdropManager {
+    static let shared = DesktopBackdropManager()
+
+    private struct Snapshot: Codable {
+        let displayID: UInt32
+        let imageURL: URL
+        let optionsArchive: Data
+    }
+
+    private static let snapshotsKey = "desktopBackdropSnapshots"
+    private let workspace = NSWorkspace.shared
+    private let defaults = UserDefaults.standard
+    private var snapshots: [UInt32: Snapshot] = [:]
+    private var posterURL: URL?
+
+    private init() {
+        if let data = defaults.data(forKey: Self.snapshotsKey),
+           let values = try? JSONDecoder().decode([Snapshot].self, from: data) {
+            snapshots = Dictionary(uniqueKeysWithValues: values.map { ($0.displayID, $0) })
+        }
+    }
+
+    func activate(videoURL: URL, scaleType: VideoScaleType) async throws {
+        if posterURL == nil {
+            posterURL = try await makePoster(from: videoURL)
+        }
+        try apply(scaleType: scaleType)
+    }
+
+    func apply(scaleType: VideoScaleType) throws {
+        guard let posterURL else { return }
+        var capturedNewSnapshot = false
+
+        for screen in NSScreen.screens {
+            let displayID = Self.displayID(for: screen)
+            if snapshots[displayID] == nil,
+               let imageURL = workspace.desktopImageURL(for: screen) {
+                let options = workspace.desktopImageOptions(for: screen) ?? [:]
+                let archive = try NSKeyedArchiver.archivedData(
+                    withRootObject: options,
+                    requiringSecureCoding: false
+                )
+                snapshots[displayID] = Snapshot(
+                    displayID: displayID,
+                    imageURL: imageURL,
+                    optionsArchive: archive
+                )
+                capturedNewSnapshot = true
+            }
+        }
+
+        // Persist the restore point before macOS is changed. A crash can then
+        // never turn Livecore's poster into the user's permanent wallpaper.
+        if capturedNewSnapshot {
+            try persistSnapshots()
+        }
+
+        do {
+            for screen in NSScreen.screens {
+                try workspace.setDesktopImageURL(
+                    posterURL,
+                    for: screen,
+                    options: Self.options(for: scaleType)
+                )
+            }
+        } catch {
+            restore()
+            throw error
+        }
+    }
+
+    func restore() {
+        guard !snapshots.isEmpty else {
+            removePoster()
+            return
+        }
+
+        var failed = false
+        for screen in NSScreen.screens {
+            let displayID = Self.displayID(for: screen)
+            guard let snapshot = snapshots[displayID] else { continue }
+            let options = (try? NSKeyedUnarchiver.unarchivedObject(
+                ofClasses: [NSDictionary.self, NSString.self, NSNumber.self, NSColor.self],
+                from: snapshot.optionsArchive
+            )) as? [NSWorkspace.DesktopImageOptionKey: Any] ?? [:]
+            do {
+                try workspace.setDesktopImageURL(
+                    snapshot.imageURL,
+                    for: screen,
+                    options: options
+                )
+            } catch {
+                failed = true
+            }
+        }
+
+        guard !failed else { return }
+        snapshots.removeAll()
+        defaults.removeObject(forKey: Self.snapshotsKey)
+        removePoster()
+    }
+
+    private func persistSnapshots() throws {
+        let data = try JSONEncoder().encode(Array(snapshots.values))
+        defaults.set(data, forKey: Self.snapshotsKey)
+    }
+
+    private func makePoster(from videoURL: URL) async throws -> URL {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: videoURL))
+        generator.appliesPreferredTrackTransform = true
+        let image = try await generator.image(
+            at: CMTime(seconds: 0.1, preferredTimescale: 600)
+        ).image
+        guard let data = NSBitmapImageRep(cgImage: image).representation(
+            using: .jpeg,
+            properties: [.compressionFactor: 0.92]
+        ) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+
+        let directory = try FileManager.default.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+        ).appendingPathComponent("Livecore", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        let url = directory.appendingPathComponent("desktop-backdrop.jpg")
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
+    private func removePoster() {
+        if let posterURL {
+            try? FileManager.default.removeItem(at: posterURL)
+        }
+        posterURL = nil
+    }
+
+    private static func displayID(for screen: NSScreen) -> UInt32 {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?
+            .uint32Value ?? 0
+    }
+
+    private static func options(
+        for scaleType: VideoScaleType
+    ) -> [NSWorkspace.DesktopImageOptionKey: Any] {
+        let scaling: NSImageScaling
+        let allowClipping: Bool
+        switch scaleType {
+        case .fill:
+            scaling = .scaleProportionallyUpOrDown
+            allowClipping = true
+        case .fit:
+            scaling = .scaleProportionallyUpOrDown
+            allowClipping = false
+        case .stretch:
+            scaling = .scaleAxesIndependently
+            allowClipping = true
+        case .center:
+            scaling = .scaleNone
+            allowClipping = false
+        }
+        return [
+            .imageScaling: scaling.rawValue,
+            .allowClipping: allowClipping,
+            .fillColor: NSColor.black,
+        ]
+    }
+}
+
+@MainActor
 final class WallpaperEngine {
     static let shared = WallpaperEngine()
 
@@ -298,7 +473,9 @@ final class WallpaperEngine {
         // Screen and session notifications come from the workspace center, not
         // the default one; observing them on `.default` never fires.
         let workspace = NSWorkspace.shared.notificationCenter
-        observe(NSApplication.didChangeScreenParametersNotification, on: .default) { $0.rebuildForCurrentScreens() }
+        observe(NSApplication.didChangeScreenParametersNotification, on: .default) {
+            try? $0.rebuildForCurrentScreens()
+        }
         observe(NSWorkspace.screensDidSleepNotification, on: workspace) { $0.pause() }
         observe(NSWorkspace.screensDidWakeNotification, on: workspace) { $0.resume() }
         observe(NSWorkspace.sessionDidResignActiveNotification, on: workspace) { $0.pause() }
@@ -320,7 +497,7 @@ final class WallpaperEngine {
         observers.append((center, token))
     }
 
-    func start(videoURL: URL, scaleType: VideoScaleType) throws {
+    func start(videoURL: URL, scaleType: VideoScaleType) async throws {
         guard FileManager.default.fileExists(atPath: videoURL.path) else {
             throw NSError(
                 domain: "Livecore",
@@ -332,10 +509,20 @@ final class WallpaperEngine {
         securityScopedURL = videoURL.startAccessingSecurityScopedResource() ? videoURL : nil
         activeURL = videoURL
         activeScaleType = scaleType
-        rebuildForCurrentScreens()
+        do {
+            try await DesktopBackdropManager.shared.activate(
+                videoURL: videoURL,
+                scaleType: scaleType
+            )
+            try rebuildForCurrentScreens(applyBackdrop: false)
+        } catch {
+            stop()
+            throw error
+        }
     }
 
     func stop() {
+        DesktopBackdropManager.shared.restore()
         surfaces.forEach { $0.close() }
         surfaces.removeAll()
         activeURL = nil
@@ -349,7 +536,8 @@ final class WallpaperEngine {
     func setScale(_ scale: VideoScaleType) {
         guard activeScaleType != scale else { return }
         activeScaleType = scale
-        rebuildForCurrentScreens()
+        try? DesktopBackdropManager.shared.apply(scaleType: scale)
+        try? rebuildForCurrentScreens(applyBackdrop: false)
     }
 
     func pause() { surfaces.forEach { $0.pause() } }
@@ -361,9 +549,12 @@ final class WallpaperEngine {
         surfaces.forEach { $0.resume() }
     }
 
-    func rebuildForCurrentScreens() {
+    func rebuildForCurrentScreens(applyBackdrop: Bool = true) throws {
         guard let activeURL else {
             return
+        }
+        if applyBackdrop {
+            try DesktopBackdropManager.shared.apply(scaleType: activeScaleType)
         }
         surfaces.forEach { $0.close() }
         surfaces = NSScreen.screens.map {
@@ -403,12 +594,16 @@ final class PowerAssertionManager {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dashboard: DashboardWindowController?
     private var statusItem: NSStatusItem?
+    private var playMenuItem: NSMenuItem?
+    private var stopMenuItem: NSMenuItem?
     private var keepAwakeMenuItem: NSMenuItem?
     private var scaleMenuItems: [NSMenuItem] = []
+    private var isQuitCleanupRunning = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let needsInstallationCleanup = AppSettings.shared.prepareForCurrentInstallation()
         if needsInstallationCleanup {
+            DesktopBackdropManager.shared.restore()
             LoginItemManager.shared.resetForNewInstallation()
         }
         NSApp.setActivationPolicy(.accessory)
@@ -428,35 +623,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
 
-        do {
-            let videoURL = try AppSettings.shared.resolveVideoURL()
-            if AppSettings.shared.desktopEnabled, let videoURL {
-                try WallpaperEngine.shared.start(
-                    videoURL: videoURL,
-                    scaleType: AppSettings.shared.scaleType
-                )
-            }
-            if videoURL == nil {
+        Task {
+            do {
+                let videoURL = try AppSettings.shared.resolveVideoURL()
+                if AppSettings.shared.desktopEnabled, let videoURL {
+                    try await WallpaperEngine.shared.start(
+                        videoURL: videoURL,
+                        scaleType: AppSettings.shared.scaleType
+                    )
+                }
+                if videoURL == nil {
+                    showSettings()
+                }
+            } catch {
                 showSettings()
+                NSApp.presentError(error)
             }
-        } catch {
-            showSettings()
-            NSApp.presentError(error)
         }
     }
 
     private func installStatusMenu() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        item.button?.image = NSImage(
+        let statusImage = NSImage(
             systemSymbolName: "play.rectangle.on.rectangle",
             accessibilityDescription: "Livecore"
         )
+        statusImage?.isTemplate = true
+        item.button?.image = statusImage
+        item.isVisible = true
 
         let menu = NSMenu()
+        menu.autoenablesItems = false
         menu.delegate = self
         menu.addItem(NSMenuItem(title: "Open App", action: #selector(showSettings), keyEquivalent: ","))
-        menu.addItem(NSMenuItem(title: "Play on Desktop", action: #selector(playSavedVideo), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Stop Desktop Playback", action: #selector(stopPlayback), keyEquivalent: ""))
+        let playItem = NSMenuItem(
+            title: "Play on Desktop",
+            action: #selector(playSavedVideo),
+            keyEquivalent: ""
+        )
+        let stopItem = NSMenuItem(
+            title: "Stop Desktop Playback",
+            action: #selector(stopPlayback),
+            keyEquivalent: ""
+        )
+        menu.addItem(playItem)
+        menu.addItem(stopItem)
+        playMenuItem = playItem
+        stopMenuItem = stopItem
 
         let scaleMenu = NSMenu()
         for (index, scale) in VideoScaleType.allCases.enumerated() {
@@ -491,10 +704,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The dashboard writes the same settings, so the menu re-reads them every
     /// time it opens instead of trying to stay in sync from the other side.
     func menuWillOpen(_ menu: NSMenu) {
+        updatePlaybackMenuItemStates()
         updateKeepAwakeMenuItemState()
         for item in scaleMenuItems {
             item.state = VideoScaleType.allCases[item.tag] == AppSettings.shared.scaleType ? .on : .off
         }
+    }
+
+    private func updatePlaybackMenuItemStates() {
+        let hasVideo = (try? AppSettings.shared.resolveVideoURL()) != nil
+        let isDesktopActive = WallpaperEngine.shared.isActive
+        playMenuItem?.isEnabled = hasVideo && !isDesktopActive
+        stopMenuItem?.isEnabled = isDesktopActive
     }
 
     func updateKeepAwakeMenuItemState() {
@@ -518,21 +739,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func playSavedVideo() {
-        do {
-            guard let url = try AppSettings.shared.resolveVideoURL() else {
-                showSettings()
-                return
+        Task {
+            do {
+                guard let url = try AppSettings.shared.resolveVideoURL() else {
+                    showSettings()
+                    return
+                }
+                try await WallpaperEngine.shared.start(
+                    videoURL: url,
+                    scaleType: AppSettings.shared.scaleType
+                )
+                AppSettings.shared.desktopEnabled = true
+                updatePlaybackMenuItemStates()
+            } catch {
+                NSApp.presentError(error)
             }
-            try WallpaperEngine.shared.start(videoURL: url, scaleType: AppSettings.shared.scaleType)
-            AppSettings.shared.desktopEnabled = true
-        } catch {
-            NSApp.presentError(error)
         }
     }
 
     @objc private func stopPlayback() {
         WallpaperEngine.shared.stop()
         AppSettings.shared.desktopEnabled = false
+        updatePlaybackMenuItemStates()
     }
 
     @objc private func changeScale(_ sender: NSMenuItem) {
@@ -548,6 +776,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isQuitCleanupRunning else { return .terminateLater }
+        isQuitCleanupRunning = true
+
+        // Disappear immediately so the asynchronous WallpaperAgent handshake
+        // never presents as a frozen app during quit.
+        dashboard?.window?.orderOut(nil)
+
+        Task {
+            do {
+                try await WallpaperStoreManager.shared.deactivateLockScreen()
+                WallpaperEngine.shared.stop()
+                sender.reply(toApplicationShouldTerminate: true)
+            } catch {
+                isQuitCleanupRunning = false
+                showSettings()
+                sender.reply(toApplicationShouldTerminate: false)
+                sender.presentError(error)
+            }
+        }
+        return .terminateLater
     }
 }
 

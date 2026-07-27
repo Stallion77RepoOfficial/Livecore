@@ -413,17 +413,32 @@ final class DashboardWindowController: NSWindowController {
             setStatus("Choose a video first.", error: true)
             return
         }
+
+        let scale = VideoScaleType.allCases[scaleControl.selectedSegment]
         do {
-            let scale = VideoScaleType.allCases[scaleControl.selectedSegment]
             try settings.saveVideoURL(selectedURL)
             settings.scaleType = scale
-            try WallpaperEngine.shared.start(videoURL: selectedURL, scaleType: scale)
-            settings.desktopEnabled = true
-            setStatus("Applied to Desktop.")
         } catch {
             setStatus(error.localizedDescription, error: true)
+            return
         }
-        updateButtonStates()
+
+        setBusy(true)
+        setStatus("Applying to Desktop…")
+        Task {
+            do {
+                try await WallpaperEngine.shared.start(
+                    videoURL: selectedURL,
+                    scaleType: scale
+                )
+                settings.desktopEnabled = true
+                setStatus("Applied to Desktop.")
+            } catch {
+                setStatus(error.localizedDescription, error: true)
+            }
+            setBusy(false)
+            updateButtonStates()
+        }
     }
 
     @objc private func stopDesktopWallpaper() {

@@ -1,496 +1,354 @@
 import AppKit
 import AVFoundation
 import CoreImage
-import Darwin
 import Foundation
 import ImageIO
-import UniformTypeIdentifiers
 
 enum LivecoreProviderError: LocalizedError {
-    case wallpaperStoreUnavailable
-    case invalidWallpaperStore
-    case wallpaperStoreChanged
-    case pluginNotInstalled
-    case pluginRegistrationFailed(String)
-    case lockScreenSelectionUnavailable
-    case rendererDidNotStart
-    case desktopCaptureFailed(String)
-    case rollbackFailed(String)
-    case unsupportedSystem
+    case extensionMissingFromBundle
+    case extensionNotInstalled
+    case extensionContainerUnavailable
+    case pluginKitFailed(String)
+    case videoUnavailable
+    case noDisplaysAvailable
+    case lockScreenSelectionRejected
+    case lockScreenRendererUnavailable
+    case lockScreenRollbackFailed
 
     var errorDescription: String? {
         switch self {
-        case .wallpaperStoreUnavailable:
-            return "The macOS wallpaper store could not be found."
-        case .invalidWallpaperStore:
-            return "The macOS wallpaper store has an unexpected format."
-        case .wallpaperStoreChanged:
-            return "macOS changed the wallpaper while Livecore was applying it. Please try again."
-        case .pluginNotInstalled:
-            return "The current Livecore wallpaper extension build is not installed."
-        case .pluginRegistrationFailed(let detail):
-            return "The Livecore wallpaper extension could not be registered. \(detail)"
-        case .lockScreenSelectionUnavailable:
-            return "macOS rejected the Livecore Lock Screen selection."
-        case .rendererDidNotStart:
-            return "The Livecore renderer did not start, so the previous wallpaper was restored."
-        case .desktopCaptureFailed(let display):
-            return "The current Desktop image could not be captured for display \(display). Nothing was changed."
-        case .rollbackFailed(let detail):
-            return "The wallpaper change failed and macOS could not confirm the rollback. Livecore kept the video files so the screen cannot go black. \(detail)"
-        case .unsupportedSystem:
-            return "Livecore Lock Screen wallpapers require macOS 14.0 or later."
+        case .extensionMissingFromBundle:
+            return "This Livecore build does not contain the wallpaper extension."
+        case .extensionNotInstalled:
+            return "Install the Livecore wallpaper extension first."
+        case .extensionContainerUnavailable:
+            return "macOS has not created the wallpaper extension's storage yet."
+        case .pluginKitFailed(let detail):
+            return "macOS refused to change the Livecore wallpaper extension. \(detail)"
+        case .videoUnavailable:
+            return "The prepared video is incomplete, so nothing was changed."
+        case .noDisplaysAvailable:
+            return "macOS reported no connected displays, so nothing was changed."
+        case .lockScreenSelectionRejected:
+            return "macOS did not accept the Livecore Lock Screen selection."
+        case .lockScreenRendererUnavailable:
+            return "The Livecore wallpaper extension did not create a healthy renderer."
+        case .lockScreenRollbackFailed:
+            return "Livecore could not safely restore the previous Lock Screen. The active assets were kept to prevent a black screen."
         }
     }
-
-    var mustPreservePublishedItem: Bool {
-        if case .rollbackFailed = self { return true }
-        return false
-    }
 }
 
-struct LivecoreWallpaperItem: Codable, Equatable {
-    let id: UUID
-    let fileName: String
-    let title: String
-    let createdAt: Date
-    let desktopImageFileNames: [String: String]?
-
-    init(
-        id: UUID,
-        fileName: String,
-        title: String,
-        createdAt: Date,
-        desktopImageFileNames: [String: String]? = nil
-    ) {
-        self.id = id
-        self.fileName = fileName
-        self.title = title
-        self.createdAt = createdAt
-        self.desktopImageFileNames = desktopImageFileNames
-    }
-}
-
-private struct LivecorePlaybackState: Codable {
-    let enabled: Bool
-    let updatedAt: Date
-}
-
-private struct LivecoreRendererReadyState: Codable {
-    let itemID: UUID
-    let updatedAt: Date
-    let runtimeBuild: String
-}
-
-private struct LivecoreSettingsReadyState: Codable {
-    let itemID: UUID
-    let updatedAt: Date
-    let runtimeBuild: String
-}
-
-private struct DesktopImageSource {
-    let displayID: String
-    let url: URL?
-}
-
+/// The video library the app writes and the extension reads.
+///
+/// Storage lives inside the extension's sandbox container, the only directory
+/// both processes reach without an App Group. The app never creates that
+/// container: `containermanagerd` owns it, and a directory the app made first
+/// has no container metadata, so macOS replaces it and silently discards
+/// whatever was written there. Writes therefore require the container to exist,
+/// which installing the extension guarantees.
 final class LivecoreWallpaperLibrary: @unchecked Sendable {
     static let shared = LivecoreWallpaperLibrary()
-    static let releaseExtensionBundleID = "com.livecore.app.wallpaper-extension"
 
-    static var extensionBundleID: String {
-        let extensionURL = Bundle.main.bundleURL
+    static var embeddedExtensionURL: URL {
+        Bundle.main.bundleURL
             .appendingPathComponent("Contents/Extensions/LivecoreWallpaperExtension.appex")
-        return Bundle(url: extensionURL)?.bundleIdentifier ?? releaseExtensionBundleID
     }
 
-    static var extensionRuntimeBuild: String {
-        let extensionURL = Bundle.main.bundleURL
-            .appendingPathComponent("Contents/Extensions/LivecoreWallpaperExtension.appex")
-        let bundle = Bundle(url: extensionURL)
-        let version = bundle?.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
-        guard let executableName = bundle?.object(forInfoDictionaryKey: "CFBundleExecutable") as? String else {
-            return "\(version):missing-executable"
+    /// Identifier of the extension this build embeds, read from the appex so
+    /// there is exactly one source of truth for the container path.
+    static let extensionBundleID: String = {
+        guard let identifier = Bundle(url: embeddedExtensionURL)?.bundleIdentifier else {
+            preconditionFailure("Livecore.app was built without its wallpaper extension")
         }
-        let executableDirectory = extensionURL.appendingPathComponent("Contents/MacOS", isDirectory: true)
-        let debugLibrary = executableDirectory.appendingPathComponent("\(executableName).debug.dylib")
-        let executable = executableDirectory.appendingPathComponent(executableName)
-        let codeURL = FileManager.default.fileExists(atPath: debugLibrary.path) ? debugLibrary : executable
-        return "\(version):\(machOUUID(at: codeURL) ?? "unreadable-code")"
-    }
+        return identifier
+    }()
 
-    /// Read the linker-generated UUID from the exact extension image that the
-    /// current app embeds. The extension reports the UUID of the image actually
-    /// loaded in its process, so a stale Xcode process cannot impersonate a
-    /// freshly rebuilt extension merely by sharing CFBundleVersion and path.
-    private static func machOUUID(at url: URL) -> String? {
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe), data.count >= 32 else {
-            return nil
-        }
-        func uint32(at offset: Int) -> UInt32? {
-            guard offset >= 0, offset + 4 <= data.count else { return nil }
-            return data[offset..<(offset + 4)].withUnsafeBytes {
-                UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self))
-            }
-        }
-        guard uint32(at: 0) == 0xfeedfacf, let commandCount = uint32(at: 16) else {
-            return nil
-        }
-        var offset = 32
-        for _ in 0..<commandCount {
-            guard let command = uint32(at: offset),
-                  let commandSizeValue = uint32(at: offset + 4)
-            else { return nil }
-            let commandSize = Int(commandSizeValue)
-            guard commandSize >= 8, offset <= data.count - commandSize else { return nil }
-            if command == 0x1b, commandSize >= 24 {
-                let bytes = data[(offset + 8)..<(offset + 24)]
-                let hex = bytes.map { String(format: "%02X", $0) }.joined()
-                return [
-                    String(hex.prefix(8)),
-                    String(hex.dropFirst(8).prefix(4)),
-                    String(hex.dropFirst(12).prefix(4)),
-                    String(hex.dropFirst(16).prefix(4)),
-                    String(hex.dropFirst(20).prefix(12)),
-                ].joined(separator: "-")
-            }
-            offset += commandSize
-        }
-        return nil
-    }
-
+    private let containerURL: URL
+    private let containerDocumentsURL: URL
+    private let reader: LivecoreLibraryReader
     private let fileManager = FileManager.default
-    private let queue = DispatchQueue(label: "\(Bundle.main.bundleIdentifier ?? "com.livecore.app").wallpaper-library", qos: .default)
+    private let queue = DispatchQueue(label: "com.livecore.app.wallpaper-library", qos: .userInitiated)
 
-    var root: URL {
-        let url = fileManager.homeDirectoryForCurrentUser
+    private init() {
+        let container = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(
-                "Library/Containers/\(Self.extensionBundleID)/Data/Documents/WallpaperLibrary",
+                "Library/Containers/\(Self.extensionBundleID)",
                 isDirectory: true
             )
-        try? fileManager.createDirectory(at: url, withIntermediateDirectories: true)
-        return url
+        containerURL = container
+        containerDocumentsURL = container
+            .appendingPathComponent("Data/Documents", isDirectory: true)
+        reader = LivecoreLibraryReader(
+            root: containerDocumentsURL.appendingPathComponent(
+                LivecoreLibraryFile.directoryName,
+                isDirectory: true
+            )
+        )
     }
 
-    var lockScreenBackupURL: URL { root.appendingPathComponent("lock-screen-backup.plist") }
-    var rendererReadyURL: URL { root.appendingPathComponent("renderer-ready.json") }
-    var settingsReadyURL: URL { root.appendingPathComponent("settings-ready.json") }
+    var root: URL { reader.root }
+    var lockScreenBackupURL: URL { reader.url(LivecoreLibraryFile.lockScreenBackup) }
+    var legacyLockScreenBackupURL: URL { reader.url("lock-screen-backup.plist") }
 
+    /// True only for a container provisioned by containermanagerd. Older
+    /// Livecore builds could create a look-alike Documents path without this
+    /// metadata; writing there loses the assets when macOS later replaces it.
+    var containerExists: Bool {
+        let metadataURL = containerURL.appendingPathComponent(
+            ".com.apple.containermanagerd.metadata.plist"
+        )
+        guard fileManager.fileExists(atPath: containerDocumentsURL.path),
+              let data = try? Data(contentsOf: metadataURL),
+              let metadata = try? PropertyListSerialization.propertyList(
+                  from: data,
+                  format: nil
+              ) as? [String: Any],
+              metadata["MCMMetadataIdentifier"] as? String == Self.extensionBundleID
+        else { return false }
+        return true
+    }
+
+    func currentItem() -> LivecoreWallpaperItem? { queue.sync { reader.currentItem() } }
+
+    func item(withID id: UUID) -> LivecoreWallpaperItem? { queue.sync { reader.item(id) } }
+
+    func itemIsUsable(_ item: LivecoreWallpaperItem) -> Bool {
+        queue.sync { reader.itemIsUsable(item) }
+    }
+
+    /// Copies a video, its poster frame and one still per display into the
+    /// library without changing what is published.
     func prepareVideo(
         at source: URL,
-        inheritingDesktopFrom previousItem: LivecoreWallpaperItem? = nil
-    ) throws -> LivecoreWallpaperItem {
-        // AppKit must be queried on the main thread. Capture these URLs before
-        // taking the library queue so the main thread can never wait on that
-        // queue while a background preparation waits on main.sync.
-        let desktopSources = desktopImageSources()
+        inheritingDesktopFrom previousItem: LivecoreWallpaperItem?
+    ) async throws -> LivecoreWallpaperItem {
+        let displays = await desktopPictures()
+        guard let primaryDisplayID = displays.first?.displayID else {
+            throw LivecoreProviderError.noDisplaysAvailable
+        }
+
+        let itemID = UUID()
+        let accessed = source.startAccessingSecurityScopedResource()
+        defer { if accessed { source.stopAccessingSecurityScopedResource() } }
+
+        let poster = try await jpeg(
+            from: source,
+            at: CMTime(seconds: 0.1, preferredTimescale: 600),
+            maximumSize: NSSize(width: 1920, height: 1080)
+        )
+        // Preferred still is the Desktop picture the display is showing right
+        // now, so taking over the Desktop slot stays invisible while unlocked.
+        // When macOS will not name a usable picture the video's own poster is
+        // the only sensible thing to paint.
+        var stills: [String: (name: String, data: Data)] = [:]
+        for display in displays {
+            stills[display.displayID] = (
+                LivecoreLibraryFile.desktopImage(itemID, displayID: display.displayID),
+                await desktopStill(at: display.url)
+                    ?? inheritedStill(from: previousItem, displayID: display.displayID)
+                    ?? poster
+            )
+        }
+
+        var names = stills.mapValues(\.name)
+        // A display connected later has no still of its own.
+        names[LivecoreLibraryFile.defaultDisplayKey] = names[primaryDisplayID]
+
+        let ext = source.pathExtension.isEmpty ? "mov" : source.pathExtension.lowercased()
+        let item = LivecoreWallpaperItem(
+            id: itemID,
+            fileName: "\(itemID.uuidString).\(ext)",
+            title: source.deletingPathExtension().lastPathComponent,
+            desktopImageFileNames: names
+        )
+
         return try queue.sync {
-            let itemID = UUID()
-            let ext = source.pathExtension.isEmpty ? "mov" : source.pathExtension.lowercased()
-            let fileName = "\(itemID.uuidString).\(ext)"
-            let destination = root.appendingPathComponent(fileName)
-            let accessed = source.startAccessingSecurityScopedResource()
-            defer { if accessed { source.stopAccessingSecurityScopedResource() } }
-
-            var createdURLs: [URL] = []
+            try makeLibraryDirectory()
             do {
-                try fileManager.copyItem(at: source, to: destination)
-                createdURLs.append(destination)
-
-                let thumbnailURL = root.appendingPathComponent("\(itemID.uuidString).jpg")
-                try makeThumbnail(for: destination, at: thumbnailURL)
-                createdURLs.append(thumbnailURL)
-
-                let backgrounds = try copyDesktopBackgrounds(
-                    for: itemID,
-                    inheritingFrom: previousItem,
-                    desktopSources: desktopSources,
-                    createdURLs: &createdURLs
+                try poster.write(to: reader.thumbnailURL(for: item), options: .atomic)
+                for still in stills.values {
+                    try still.data.write(to: reader.url(still.name), options: .atomic)
+                }
+                try fileManager.copyItem(at: source, to: reader.videoURL(for: item))
+                try JSONEncoder().encode(item).write(
+                    to: reader.url(LivecoreLibraryFile.metadata(item.id)),
+                    options: .atomic
                 )
-                let item = LivecoreWallpaperItem(
-                    id: itemID,
-                    fileName: fileName,
-                    title: source.deletingPathExtension().lastPathComponent,
-                    createdAt: Date(),
-                    desktopImageFileNames: backgrounds.isEmpty ? nil : backgrounds
-                )
-                let metadataURL = itemMetadataURL(item.id)
-                try JSONEncoder().encode(item).write(to: metadataURL, options: .atomic)
-                createdURLs.append(metadataURL)
                 return item
             } catch {
-                createdURLs.forEach { try? fileManager.removeItem(at: $0) }
+                reader.assetURLs(for: item).forEach { try? fileManager.removeItem(at: $0) }
                 throw error
             }
         }
     }
 
-    @discardableResult
-    func importVideo(at source: URL) throws -> LivecoreWallpaperItem {
-        let previous = currentItem()
-        let item = try prepareVideo(at: source, inheritingDesktopFrom: previous)
-        do {
-            try publish(item, playbackEnabled: true)
-            return item
-        } catch {
-            discard(item)
-            throw error
-        }
-    }
-
-    func publish(_ item: LivecoreWallpaperItem, playbackEnabled: Bool) throws {
+    /// Makes `item` the one the extension renders.
+    func publish(_ item: LivecoreWallpaperItem) throws {
         try queue.sync {
-            guard itemIsUsableLocked(item) else { throw CocoaError(.fileReadNoSuchFile) }
-            try JSONEncoder().encode(item).write(to: itemMetadataURL(item.id), options: .atomic)
-            try JSONEncoder().encode(item).write(to: root.appendingPathComponent("current.json"), options: .atomic)
-            try writePlaybackStateLocked(playbackEnabled)
-            try? fileManager.removeItem(at: rendererReadyURL)
-            try? fileManager.removeItem(at: settingsReadyURL)
+            guard reader.itemIsUsable(item) else { throw LivecoreProviderError.videoUnavailable }
+            try JSONEncoder().encode(item).write(
+                to: reader.url(LivecoreLibraryFile.current),
+                options: .atomic
+            )
         }
     }
 
-    func restore(_ item: LivecoreWallpaperItem?, playbackEnabled: Bool) {
-        queue.sync {
-            let currentURL = root.appendingPathComponent("current.json")
-            if let item, itemIsUsableLocked(item), let data = try? JSONEncoder().encode(item) {
-                try? data.write(to: currentURL, options: .atomic)
-            } else {
-                try? fileManager.removeItem(at: currentURL)
-            }
-            try? writePlaybackStateLocked(playbackEnabled)
-            try? fileManager.removeItem(at: rendererReadyURL)
-            try? fileManager.removeItem(at: settingsReadyURL)
+    func unpublish() throws {
+        try queue.sync {
+            let current = reader.url(LivecoreLibraryFile.current)
+            guard fileManager.fileExists(atPath: current.path) else { return }
+            try fileManager.removeItem(at: current)
         }
     }
 
+    /// Deletes an item that was prepared but never became the published one.
     func discard(_ item: LivecoreWallpaperItem) {
         queue.sync {
-            guard currentItemLocked()?.id != item.id else { return }
-            assetURLs(for: item).forEach { try? fileManager.removeItem(at: $0) }
+            guard reader.currentItem()?.id != item.id else { return }
+            reader.assetURLs(for: item).forEach { try? fileManager.removeItem(at: $0) }
         }
     }
 
-    func removeObsoleteAssets(keeping item: LivecoreWallpaperItem) {
-        queue.sync {
-            let preserved = Set(assetURLs(for: item).map(\.lastPathComponent) + [
-                "current.json", "playback-state.json", "renderer-ready.json", "settings-ready.json",
-                "lock-screen-backup.plist",
-            ])
-            for url in (try? fileManager.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
-            where !preserved.contains(url.lastPathComponent) {
-                try? fileManager.removeItem(at: url)
+    func purge() throws {
+        try queue.sync {
+            guard fileManager.fileExists(atPath: root.path) else { return }
+            try fileManager.removeItem(at: root)
+        }
+    }
+
+    /// With every extension process stopped, only the published item and
+    /// restore points can still be needed. This removes failed-apply orphans
+    /// without guessing while a renderer may have a file open.
+    func pruneUnpublishedItems(retaining selectedItemID: UUID?) throws {
+        try queue.sync {
+            guard fileManager.fileExists(atPath: root.path) else { return }
+            var retained: Set<String> = []
+            var retainedIDs: Set<UUID> = []
+            if let current = reader.currentItem() {
+                retainedIDs.insert(current.id)
+                retained.formUnion(reader.assetURLs(for: current).map {
+                    $0.standardizedFileURL.path
+                })
+            }
+            if let selectedItemID, !retainedIDs.contains(selectedItemID) {
+                // A partial earlier mutation can leave Wallpaper settings and
+                // current.json out of sync. If its metadata is unavailable,
+                // preserve everything rather than delete the selected video.
+                guard let selected = reader.item(selectedItemID) else { return }
+                retained.formUnion(reader.assetURLs(for: selected).map {
+                    $0.standardizedFileURL.path
+                })
+            }
+            retained.insert(reader.url(LivecoreLibraryFile.current).standardizedFileURL.path)
+            retained.insert(lockScreenBackupURL.standardizedFileURL.path)
+            retained.insert(legacyLockScreenBackupURL.standardizedFileURL.path)
+
+            for url in try fileManager.contentsOfDirectory(
+                at: root,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ) {
+                guard (try url.resourceValues(forKeys: [.isRegularFileKey])).isRegularFile == true,
+                      !retained.contains(url.standardizedFileURL.path)
+                else { continue }
+                try fileManager.removeItem(at: url)
             }
         }
     }
 
-    func currentItem() -> LivecoreWallpaperItem? { queue.sync { currentItemLocked() } }
-
-    func item(withID id: UUID) -> LivecoreWallpaperItem? {
-        queue.sync {
-            if let data = try? Data(contentsOf: itemMetadataURL(id)),
-               let item = try? JSONDecoder().decode(LivecoreWallpaperItem.self, from: data) {
-                return item
-            }
-            let current = currentItemLocked()
-            return current?.id == id ? current : nil
+    @MainActor
+    private func desktopPictures() -> [(displayID: String, url: URL?)] {
+        NSScreen.screens.map { screen in
+            let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
+            return (
+                number?.stringValue ?? LivecoreLibraryFile.defaultDisplayKey,
+                NSWorkspace.shared.desktopImageURL(for: screen)
+            )
         }
     }
 
-    func itemIsUsable(_ item: LivecoreWallpaperItem) -> Bool { queue.sync { itemIsUsableLocked(item) } }
+    /// The Desktop picture re-encoded as a JPEG, or nil when macOS has none to
+    /// give. Decoding matters: the URL may name a video (aerial and dynamic
+    /// wallpapers), and copying raw bytes into a `.jpg` would leave the
+    /// renderer with a still it cannot load.
+    private func desktopStill(at source: URL?) async -> Data? {
+        // A library path is a Livecore video from an earlier apply, never the
+        // Desktop the user chose.
+        guard let source,
+              !source.path.contains("/\(LivecoreLibraryFile.directoryName)/")
+        else { return nil }
 
-    func setPlaybackEnabled(_ enabled: Bool) throws {
-        try queue.sync { try writePlaybackStateLocked(enabled) }
-    }
-
-    func clearRendererReadyMarker() {
-        queue.sync { try? fileManager.removeItem(at: rendererReadyURL) }
-    }
-
-    func clearSettingsReadyMarker() {
-        queue.sync { try? fileManager.removeItem(at: settingsReadyURL) }
-    }
-
-    func rendererIsReady(for itemID: UUID, since date: Date) -> Bool {
-        queue.sync {
-            guard let data = try? Data(contentsOf: rendererReadyURL),
-                  let state = try? JSONDecoder().decode(LivecoreRendererReadyState.self, from: data)
-            else { return false }
-            return state.itemID == itemID
-                && state.updatedAt >= date
-                && state.runtimeBuild == Self.extensionRuntimeBuild
+        if let imageSource = CGImageSourceCreateWithURL(source as CFURL, nil),
+           let image = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) {
+            return image.livecoreJPEGData(quality: 0.9)
         }
+        return try? await jpeg(from: source, at: .zero, maximumSize: nil)
     }
 
-    func rendererWasConfirmed(for itemID: UUID) -> Bool {
-        rendererIsReady(for: itemID, since: .distantPast)
+    private func inheritedStill(
+        from item: LivecoreWallpaperItem?,
+        displayID: String
+    ) -> Data? {
+        guard let item,
+              let url = reader.desktopImageURL(for: item, displayID: displayID)
+        else { return nil }
+        return try? Data(contentsOf: url)
     }
 
-    func settingsModelIsReady(for itemID: UUID, since date: Date) -> Bool {
-        queue.sync {
-            guard let data = try? Data(contentsOf: settingsReadyURL),
-                  let state = try? JSONDecoder().decode(LivecoreSettingsReadyState.self, from: data)
-            else { return false }
-            return state.itemID == itemID
-                && state.updatedAt >= date
-                && state.runtimeBuild == Self.extensionRuntimeBuild
-        }
-    }
-
-    func purge() {
-        queue.sync { try? fileManager.removeItem(at: root) }
-    }
-
-    private func currentItemLocked() -> LivecoreWallpaperItem? {
-        guard let data = try? Data(contentsOf: root.appendingPathComponent("current.json")) else { return nil }
-        return try? JSONDecoder().decode(LivecoreWallpaperItem.self, from: data)
-    }
-
-    private func itemMetadataURL(_ id: UUID) -> URL {
-        root.appendingPathComponent("\(id.uuidString).json")
-    }
-
-    private func assetURLs(for item: LivecoreWallpaperItem) -> [URL] {
-        var urls = [
-            root.appendingPathComponent(item.fileName),
-            root.appendingPathComponent("\(item.id.uuidString).jpg"),
-            itemMetadataURL(item.id),
-        ]
-        urls.append(contentsOf: (item.desktopImageFileNames ?? [:]).values.map { root.appendingPathComponent($0) })
-        return urls
-    }
-
-    private func itemIsUsableLocked(_ item: LivecoreWallpaperItem) -> Bool {
-        guard fileManager.fileExists(atPath: root.appendingPathComponent(item.fileName).path),
-              fileManager.fileExists(atPath: root.appendingPathComponent("\(item.id.uuidString).jpg").path),
-              let desktopFiles = item.desktopImageFileNames,
-              desktopFiles["default"] != nil
-        else { return false }
-        return desktopFiles.values.allSatisfy {
-            fileManager.fileExists(atPath: root.appendingPathComponent($0).path)
-        }
-    }
-
-    private func writePlaybackStateLocked(_ enabled: Bool) throws {
-        let state = LivecorePlaybackState(enabled: enabled, updatedAt: Date())
-        try JSONEncoder().encode(state).write(
-            to: root.appendingPathComponent("playback-state.json"),
-            options: .atomic
-        )
-    }
-
-    private func copyDesktopBackgrounds(
-        for itemID: UUID,
-        inheritingFrom previousItem: LivecoreWallpaperItem?,
-        desktopSources: [DesktopImageSource],
-        createdURLs: inout [URL]
-    ) throws -> [String: String] {
-        var result: [String: String] = [:]
-        guard !desktopSources.isEmpty else {
-            throw LivecoreProviderError.desktopCaptureFailed("unknown")
-        }
-
-        for source in desktopSources {
-            let displayID = source.displayID
-            if let previousName = previousItem?.desktopImageFileNames?[displayID] {
-                let source = root.appendingPathComponent(previousName)
-                if fileManager.fileExists(atPath: source.path) {
-                    let name = "\(itemID.uuidString).desktop.\(displayID).jpg"
-                    let destination = root.appendingPathComponent(name)
-                    try fileManager.copyItem(at: source, to: destination)
-                    createdURLs.append(destination)
-                    result[displayID] = name
-                    continue
-                }
-            }
-            guard let sourceURL = source.url,
-                  let data = desktopImageData(at: sourceURL)
-            else { throw LivecoreProviderError.desktopCaptureFailed(displayID) }
-            let name = "\(itemID.uuidString).desktop.\(displayID).jpg"
-            let destination = root.appendingPathComponent(name)
-            try data.write(to: destination, options: .atomic)
-            createdURLs.append(destination)
-            result[displayID] = name
-        }
-        guard let primaryDisplayID = desktopSources.first?.displayID,
-              let fallbackName = result[primaryDisplayID]
-        else { throw LivecoreProviderError.desktopCaptureFailed("default") }
-        // A display connected after Apply has no captured display ID yet. Give
-        // it a deliberate primary-display still instead of a black renderer.
-        result["default"] = fallbackName
-        return result
-    }
-
-    private func desktopImageSources() -> [DesktopImageSource] {
-        let collect = {
-            NSScreen.screens.map { screen -> DesktopImageSource in
-                let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber
-                return DesktopImageSource(
-                    displayID: number?.stringValue ?? "default",
-                    url: NSWorkspace.shared.desktopImageURL(for: screen)
-                )
-            }
-        }
-        if Thread.isMainThread { return collect() }
-        return DispatchQueue.main.sync(execute: collect)
-    }
-
-    private func desktopImageData(at source: URL) -> Data? {
-        if let data = try? Data(contentsOf: source), !data.isEmpty {
-            return data
-        }
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: source))
+    private func jpeg(from url: URL, at time: CMTime, maximumSize: NSSize?) async throws -> Data {
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: url))
         generator.appliesPreferredTrackTransform = true
-        guard let cgImage = try? generator.copyCGImage(at: .zero, actualTime: nil) else { return nil }
-        let ciImage = CIImage(cgImage: cgImage)
+        if let maximumSize { generator.maximumSize = maximumSize }
+        guard let data = try await generator.image(at: time).image.livecoreJPEGData(quality: 0.9)
+        else { throw CocoaError(.fileWriteUnknown) }
+        return data
+    }
+
+    private func makeLibraryDirectory() throws {
+        guard containerExists else { throw LivecoreProviderError.extensionContainerUnavailable }
+        guard !fileManager.fileExists(atPath: root.path) else { return }
+        // No intermediates: creating the container itself is macOS's job.
+        try fileManager.createDirectory(at: root, withIntermediateDirectories: false)
+    }
+
+}
+
+private extension CGImage {
+    func livecoreJPEGData(quality: Double) -> Data? {
         let context = CIContext(options: [.useSoftwareRenderer: false])
-        let colorSpace = cgImage.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
         return context.jpegRepresentation(
-            of: ciImage,
-            colorSpace: colorSpace,
-            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.9]
+            of: CIImage(cgImage: self),
+            colorSpace: colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!,
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: quality]
         )
-    }
-
-    private func makeThumbnail(for videoURL: URL, at destination: URL) throws {
-        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: videoURL))
-        generator.appliesPreferredTrackTransform = true
-        generator.maximumSize = NSSize(width: 960, height: 540)
-        let cgImage = try generator.copyCGImage(
-            at: CMTime(seconds: 0.1, preferredTimescale: 600),
-            actualTime: nil
-        )
-        let ciImage = CIImage(cgImage: cgImage)
-        let context = CIContext(options: [.useSoftwareRenderer: false])
-        let colorSpace = cgImage.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
-        guard let data = context.jpegRepresentation(
-            of: ciImage,
-            colorSpace: colorSpace,
-            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.82]
-        ) else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-        try data.write(to: destination, options: .atomic)
     }
 }
 
 struct LivecoreLockScreenState {
-    let pluginInstalled: Bool
-    let selectedConfiguration: UUID?
-    let hasRestorePoint: Bool
+    let extensionInstalled: Bool
+    let selectedProviderID: String?
+    let selectedItemID: UUID?
     let assetsAvailable: Bool
-    let rendererConfirmed: Bool
+    let rendererResponsive: Bool
 
-    var isSelected: Bool { selectedConfiguration != nil }
-    var isHealthy: Bool { pluginInstalled && isSelected && assetsAvailable && rendererConfirmed }
-    var canStop: Bool { isSelected || hasRestorePoint }
+    var isSelected: Bool { selectedProviderID != nil }
+    var isApplied: Bool {
+        extensionInstalled
+            && selectedProviderID == WallpaperStoreManager.providerID
+            && selectedItemID != nil
+            && assetsAvailable
+            && rendererResponsive
+    }
 }
 
 private actor WallpaperMutationGate {
-    private var isLocked = false
+    private var isOccupied = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     func enter() async {
-        if !isLocked {
-            isLocked = true
+        if !isOccupied {
+            isOccupied = true
             return
         }
         await withCheckedContinuation { waiters.append($0) }
@@ -498,19 +356,87 @@ private actor WallpaperMutationGate {
 
     func leave() {
         if waiters.isEmpty {
-            isLocked = false
+            isOccupied = false
         } else {
             waiters.removeFirst().resume()
         }
     }
 }
 
+/// One-shot listener for the extension's non-persistent renderer health
+/// notifications. Nothing is written to disk and a stale process cannot make a
+/// later app launch appear healthy.
+private final class DistributedSignalWaiter: @unchecked Sendable {
+    private let center = DistributedNotificationCenter.default()
+    private let lock = NSLock()
+    private var observer: NSObjectProtocol?
+    private var continuation: CheckedContinuation<Bool, Never>?
+    private var result: Bool?
+
+    init(name: Notification.Name, object: String?) {
+        observer = center.addObserver(
+            forName: name,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            guard object == nil || notification.object as? String == object else { return }
+            self?.finish(true)
+        }
+    }
+
+    deinit {
+        if let observer { center.removeObserver(observer) }
+    }
+
+    func wait(timeout: Duration) async -> Bool {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let result {
+                lock.unlock()
+                continuation.resume(returning: result)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+
+            Task { [weak self] in
+                try? await Task.sleep(for: timeout)
+                self?.finish(false)
+            }
+        }
+    }
+
+    private func finish(_ value: Bool) {
+        let continuation: CheckedContinuation<Bool, Never>?
+        lock.lock()
+        guard result == nil else {
+            lock.unlock()
+            return
+        }
+        result = value
+        continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: value)
+    }
+}
+
+/// Installs the wallpaper extension and owns every Lock Screen mutation.
+///
+/// Dashboard actions, quit teardown and fresh-install cleanup can overlap.
+/// They all pass through the same gate so a late rollback cannot undo a newer
+/// operation.
 final class WallpaperStoreManager: @unchecked Sendable {
     static let shared = WallpaperStoreManager()
 
-    private struct ProcessResult {
-        let status: Int32
-        let output: String
+    static var providerID: String { LivecoreWallpaperLibrary.extensionBundleID }
+    private static let legacyProviderIDs: Set<String> = [
+        "com.livecore.app.wallpaper-extension.debug",
+        "com.berkegulacar.Livecore.wallpaper-extension",
+        "com.berkegulacar.Livecore.wallpaper-extension.debug",
+    ]
+    private static var knownProviderIDs: Set<String> {
+        legacyProviderIDs.union([providerID])
     }
 
     private struct PluginRecord {
@@ -524,529 +450,556 @@ final class WallpaperStoreManager: @unchecked Sendable {
     }
 
     private let fileManager = FileManager.default
-    private let queue = DispatchQueue(label: "\(Bundle.main.bundleIdentifier ?? "com.livecore.app").wallpaper-lifecycle", qos: .default)
     private let mutationGate = WallpaperMutationGate()
+    private var library: LivecoreWallpaperLibrary { .shared }
+    private var embeddedExtensionURL: URL { LivecoreWallpaperLibrary.embeddedExtensionURL }
 
-    static var providerID: String { LivecoreWallpaperLibrary.extensionBundleID }
-    /// Bundle identifiers used by earlier releases. The wallpaper store may
-    /// still select one of these after an upgrade; without recognizing them the
-    /// stale selection is treated as the user's own wallpaper, gets captured as
-    /// the restore point, and every failed activation rolls back to a provider
-    /// that no longer exists — leaving the Lock Screen unrecoverable.
-    private static let legacyProviderIDs: Set<String> = [
-        "com.berkegulacar.Livecore.wallpaper-extension",
-        "com.berkegulacar.Livecore.wallpaper-extension.debug",
-    ]
-    private static var knownProviderIDs: Set<String> {
-        legacyProviderIDs.union([providerID, LivecoreWallpaperLibrary.releaseExtensionBundleID])
-    }
+    // MARK: - State
 
-    private var storeURL: URL {
-        fileManager.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/com.apple.wallpaper/Store/Index.plist")
-    }
-
-    private var embeddedExtensionURL: URL {
-        Bundle.main.bundleURL.appendingPathComponent("Contents/Extensions/LivecoreWallpaperExtension.appex")
-    }
-
-    func isPluginInstalled() -> Bool {
-        pluginRecords(for: Self.providerID).contains {
-            sameFile($0.url, embeddedExtensionURL) && $0.isEnabled
+    func isExtensionInstalled() throws -> Bool {
+        try pluginRecords(for: Self.providerID).contains {
+            $0.isEnabled && sameFile($0.url, embeddedExtensionURL)
         }
     }
 
-    func lockScreenState() -> LivecoreLockScreenState {
-        queue.sync {
-            let configuration = (try? readStore()).flatMap(selectedLivecoreDesktopConfiguration)
-            let item = configuration.flatMap(LivecoreWallpaperLibrary.shared.item(withID:))
-            return LivecoreLockScreenState(
-                pluginInstalled: isPluginInstalled(),
-                selectedConfiguration: configuration,
-                hasRestorePoint: fileManager.fileExists(atPath: LivecoreWallpaperLibrary.shared.lockScreenBackupURL.path),
-                assetsAvailable: item.map(LivecoreWallpaperLibrary.shared.itemIsUsable) ?? false,
-                rendererConfirmed: item.map {
-                    LivecoreWallpaperLibrary.shared.rendererWasConfirmed(for: $0.id)
-                } ?? false
+    func lockScreenState() async throws -> LivecoreLockScreenState {
+        let selection = try await PrivateWallpaperSettings.selection(
+            providerIDs: Self.knownProviderIDs
+        )
+        let item: LivecoreWallpaperItem? = selection.flatMap { selection in
+            guard selection.providerID == Self.providerID, let id = selection.itemID else {
+                return nil
+            }
+            return library.item(withID: id)
+        }
+        let installed = try isExtensionInstalled()
+        var rendererResponsive = false
+        if installed, let item, library.itemIsUsable(item) {
+            let waiter = DistributedSignalWaiter(
+                name: LivecoreNotification.rendererReady,
+                object: item.id.uuidString
             )
+            notifyAssetsChanged()
+            rendererResponsive = await waiter.wait(timeout: .seconds(2))
         }
-    }
-
-    func isLockScreenActive() -> Bool { lockScreenState().isHealthy }
-
-    func refreshWallpaperSettings() { notifyWallpaperChanged() }
-
-    func installPlugin() async throws {
-        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
-        try queue.sync {
-            let extensionURL = embeddedExtensionURL
-            guard fileManager.fileExists(atPath: extensionURL.path) else {
-                throw LivecoreProviderError.pluginRegistrationFailed("The embedded extension is missing.")
-            }
-            let launchServices = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-            _ = runProcess(launchServices, ["-f", Bundle.main.bundleURL.path])
-            let registration = runProcess("/usr/bin/pluginkit", ["-a", extensionURL.path])
-            guard registration.status == 0 else {
-                throw LivecoreProviderError.pluginRegistrationFailed(registration.output)
-            }
-            let enable = runProcess("/usr/bin/pluginkit", ["-e", "use", "-i", Self.providerID])
-            guard enable.status == 0 else {
-                throw LivecoreProviderError.pluginRegistrationFailed(enable.output)
-            }
-
-            for _ in 0..<30 {
-                if isPluginInstalled() {
-                    let hasManagedSelection = (try? readStore())
-                        .flatMap(selectedLivecoreDesktopConfiguration) != nil
-                    unregisterObsoletePluginRecords(
-                        keeping: extensionURL,
-                        includeAlternateProviders: !hasManagedSelection
-                    )
-                    guard isPluginInstalled() else {
-                        throw LivecoreProviderError.pluginRegistrationFailed(
-                            "PluginKit discarded the extension from the current app build."
-                        )
-                    }
-                    return
-                }
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-            throw LivecoreProviderError.pluginRegistrationFailed(
-                "PluginKit did not enable the extension embedded in this app build."
-            )
-        }
-        if LivecoreWallpaperLibrary.shared.currentItem() != nil {
-            do {
-                try await refreshWallpaperSettingsModel(attempts: 2)
-            } catch {
-                try await recyclePluginRegistration()
-                try await refreshWallpaperSettingsModel(attempts: 5)
-            }
-        }
-    }
-
-    func refreshWallpaperSettingsModel() async throws {
-        try await refreshWallpaperSettingsModel(attempts: 5)
-    }
-
-    private func refreshWallpaperSettingsModel(attempts: Int) async throws {
-        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
-        guard isPluginInstalled() else { throw LivecoreProviderError.pluginNotInstalled }
-        guard let item = LivecoreWallpaperLibrary.shared.currentItem(),
-              LivecoreWallpaperLibrary.shared.itemIsUsable(item)
-        else { throw LivecoreProviderError.rendererDidNotStart }
-
-        let startedAt = Date()
-        LivecoreWallpaperLibrary.shared.clearSettingsReadyMarker()
-        for _ in 0..<attempts {
-            notifyWallpaperChanged()
-            try await PrivateWallpaperSettings.refreshDesktopViewModel()
-            if await waitForSettingsModel(item.id, since: startedAt, timeout: 2) {
-                notifyWallpaperChanged()
-                return
-            }
-        }
-        throw LivecoreProviderError.pluginRegistrationFailed(
-            "WallpaperAgent did not load the provider model from the current extension build."
+        return LivecoreLockScreenState(
+            extensionInstalled: installed,
+            selectedProviderID: selection?.providerID,
+            selectedItemID: selection?.itemID,
+            assetsAvailable: item.map(library.itemIsUsable) ?? false,
+            rendererResponsive: rendererResponsive
         )
     }
 
-    private func recyclePluginRegistration() async throws {
-        try queue.sync {
-            let disable = runProcess("/usr/bin/pluginkit", ["-e", "ignore", "-i", Self.providerID])
-            guard disable.status == 0 else {
-                throw LivecoreProviderError.pluginRegistrationFailed(disable.output)
-            }
-        }
-        do {
-            try await Task.sleep(for: .milliseconds(250))
-            try queue.sync {
-                let registration = runProcess("/usr/bin/pluginkit", ["-a", embeddedExtensionURL.path])
-                guard registration.status == 0 else {
-                    throw LivecoreProviderError.pluginRegistrationFailed(registration.output)
-                }
-                let enable = runProcess("/usr/bin/pluginkit", ["-e", "use", "-i", Self.providerID])
-                guard enable.status == 0 else {
-                    throw LivecoreProviderError.pluginRegistrationFailed(enable.output)
-                }
-            }
-            // Re-enabling causes ExtensionKit to retire the disabled process.
-            // Give that handoff one event-loop turn before requesting a model.
-            try await Task.sleep(for: .milliseconds(350))
-            guard isPluginInstalled() else {
-                throw LivecoreProviderError.pluginRegistrationFailed(
-                    "PluginKit did not re-enable the extension after refreshing it."
-                )
-            }
-        } catch {
-            let recycleError = error
-            // Never leave the provider elected "ignore". Best-effort repair
-            // preserves an already selected Livecore renderer even when the
-            // new build itself could not be registered.
-            let providerRecovered = queue.sync {
-                _ = runProcess("/usr/bin/pluginkit", ["-a", embeddedExtensionURL.path])
-                let enable = runProcess("/usr/bin/pluginkit", ["-e", "use", "-i", Self.providerID])
-                guard enable.status == 0 else { return false }
-                for _ in 0..<10 {
-                    if pluginRecords(for: Self.providerID).contains(where: \.isEnabled) {
-                        return true
-                    }
-                    Thread.sleep(forTimeInterval: 0.1)
-                }
-                return false
-            }
-            guard providerRecovered else {
-                throw LivecoreProviderError.rollbackFailed(
-                    "PluginKit could not re-enable the provider after a refresh failure. "
-                        + recycleError.localizedDescription
-                )
-            }
-            throw recycleError
+    // MARK: - Install / uninstall
+
+    func installExtension() async throws {
+        try await withMutation {
+            try await self.installExtensionLocked()
         }
     }
 
-    func uninstallPlugin() async throws {
-        await mutationGate.enter()
-        do {
+    private func installExtensionLocked() async throws {
+        guard fileManager.fileExists(atPath: embeddedExtensionURL.path) else {
+            throw LivecoreProviderError.extensionMissingFromBundle
+        }
+
+        let selection = try await PrivateWallpaperSettings.selection(
+            providerIDs: Self.knownProviderIDs
+        )
+        if let selection, selection.providerID != Self.providerID {
             try await deactivateLockScreenLocked()
-            try queue.sync {
-                for identifier in Self.knownProviderIDs {
-                    let disable = runProcess("/usr/bin/pluginkit", ["-e", "ignore", "-i", identifier])
-                    guard disable.status == 0 else {
-                        throw LivecoreProviderError.pluginRegistrationFailed(disable.output)
-                    }
-                    for record in pluginRecords(for: identifier) {
-                        _ = runProcess("/usr/bin/pluginkit", ["-r", record.url.path])
-                    }
-                }
-                for _ in 0..<20 where isPluginInstalled() {
-                    Thread.sleep(forTimeInterval: 0.1)
-                }
-                guard !isPluginInstalled() else {
-                    throw LivecoreProviderError.pluginRegistrationFailed("PluginKit kept the extension enabled.")
-                }
-                LivecoreWallpaperLibrary.shared.purge()
-                notifyWallpaperChanged()
+        }
+
+        try await recycleExtensionLocked(
+            purgeLegacyLibrariesAfterExit: selection?.providerID != Self.providerID
+        )
+    }
+
+    /// Forces WallpaperAgent off any stale executable before selecting the
+    /// embedded record again. Apply uses this too, so Repair never requires the
+    /// user to manually remove and reinstall the extension.
+    private func recycleExtensionLocked(
+        purgeLegacyLibrariesAfterExit: Bool = false
+    ) async throws {
+        let wasEnabled = try isExtensionInstalled()
+        let currentSelection = try await PrivateWallpaperSettings.selection(
+            providerIDs: [Self.providerID]
+        )
+        let shouldRestoreElection = wasEnabled
+            || currentSelection?.providerID == Self.providerID
+
+        // LaunchServices owns registration. Elections select the embedded
+        // record; explicit registration would create a versionless PluginKit
+        // stub that WallpaperAgent cannot launch.
+        for identifier in Self.knownProviderIDs {
+            _ = try? run("-e", "ignore", "-i", identifier)
+        }
+        do {
+            guard await terminateExtensionProcesses() else {
+                throw LivecoreProviderError.pluginKitFailed(
+                    "The previous Livecore wallpaper extension process did not exit."
+                )
             }
-            await mutationGate.leave()
+            if currentSelection == nil || currentSelection?.itemID != nil {
+                try library.pruneUnpublishedItems(
+                    retaining: currentSelection?.itemID
+                )
+            }
+            try removeStalePluginRecords(keepEmbeddedCurrent: true)
+            if purgeLegacyLibrariesAfterExit {
+                try purgeLegacyLibraries()
+            }
+            try run("-e", "ignore", "-i", Self.providerID)
+            try await Task.sleep(for: .milliseconds(250))
+            try run("-e", "use", "-i", Self.providerID)
+
+            guard try isExtensionInstalled() else {
+                throw LivecoreProviderError.pluginKitFailed(
+                    "macOS has not registered an extension for \(Bundle.main.bundleURL.path)."
+                )
+            }
+            try await waitForExtensionContainer()
+            notifyAssetsChanged()
         } catch {
-            await mutationGate.leave()
-            throw error
+            let operationError = error
+            guard shouldRestoreElection else { throw operationError }
+            _ = try? run("-e", "use", "-i", Self.providerID)
+            try? await Task.sleep(for: .milliseconds(250))
+            notifyAssetsChanged()
+            guard (try? isExtensionInstalled()) == true else {
+                throw LivecoreProviderError.pluginKitFailed(
+                    "The extension refresh failed and its previous election could not be restored."
+                )
+            }
+            throw operationError
         }
     }
 
-    func activateLockScreen(item: LivecoreWallpaperItem) async throws {
-        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
-        await mutationGate.enter()
-        do {
-            guard isPluginInstalled() else { throw LivecoreProviderError.pluginNotInstalled }
-            guard LivecoreWallpaperLibrary.shared.itemIsUsable(item) else {
-                throw LivecoreProviderError.rendererDidNotStart
+    func uninstallExtension() async throws {
+        try await withMutation {
+            try await self.deactivateLockScreenLocked()
+            for identifier in Self.knownProviderIDs {
+                _ = try? self.run("-e", "ignore", "-i", identifier)
             }
-
-            let previousSettings = try await PrivateWallpaperSettings.captureDesktopSettings()
-            let backupURL = LivecoreWallpaperLibrary.shared.lockScreenBackupURL
-            let previousBackup = try? Data(contentsOf: backupURL)
-            let wasManaged = (try? await PrivateWallpaperSettings.hasAnyProvider(Self.knownProviderIDs)) == true
-            let previousManagedConfiguration = (try? readStore())
-                .flatMap(selectedLivecoreDesktopConfiguration)
-            if !wasManaged {
-                try previousSettings.write(to: backupURL, options: .atomic)
-            } else if previousBackup == nil {
-                try await PrivateWallpaperSettings.fallbackBackup().write(
-                    to: backupURL,
-                    options: .atomic
+            guard await self.terminateExtensionProcesses() else {
+                throw LivecoreProviderError.pluginKitFailed(
+                    "The Livecore wallpaper extension process did not exit, so its assets were kept."
                 )
             }
+            try self.removeStalePluginRecords(keepEmbeddedCurrent: true)
+            try self.purgeAllLibraries()
+            self.notifyAssetsChanged()
+            guard try !self.isExtensionInstalled() else {
+                throw LivecoreProviderError.pluginKitFailed("The extension stayed enabled.")
+            }
+        }
+    }
 
-            let activationDate = Date()
-            LivecoreWallpaperLibrary.shared.clearRendererReadyMarker()
+    /// Runs once for each concrete installed executable. App deletion leaves
+    /// UserDefaults, WallpaperAgent elections, extension processes and sandbox
+    /// containers behind, so all four are treated as uninstall state.
+    func resetForNewInstallation() async throws {
+        try await withMutation {
+            try await self.deactivateLockScreenLocked()
+            for identifier in Self.knownProviderIDs {
+                _ = try? self.run("-e", "ignore", "-i", identifier)
+            }
+            guard await self.terminateExtensionProcesses() else {
+                throw LivecoreProviderError.pluginKitFailed(
+                    "A previous Livecore wallpaper extension process did not exit, so its assets were kept."
+                )
+            }
+            try self.removeStalePluginRecords(keepEmbeddedCurrent: true)
+            try self.purgeAllLibraries()
+            self.notifyAssetsChanged()
+            guard try !self.isExtensionInstalled() else {
+                throw LivecoreProviderError.pluginKitFailed(
+                    "The previous extension election stayed enabled."
+                )
+            }
+        }
+    }
+
+    private func waitForExtensionContainer() async throws {
+        var lastRefreshError: Error?
+        for _ in 0..<10 {
+            let wasProvisioned = library.containerExists
             do {
-                try await PrivateWallpaperSettings.apply(item: item, providerID: Self.providerID)
-                notifyWallpaperChanged()
-                guard await waitForStableSelection(item.id, timeout: 8) else {
-                    throw LivecoreProviderError.lockScreenSelectionUnavailable
+                // Even a provisioned container gets one successful refresh so
+                // WallpaperAgent observes the newly elected executable.
+                try await PrivateWallpaperSettings.refreshViewModels()
+                if library.containerExists { return }
+            } catch {
+                lastRefreshError = error
+            }
+            try await Task.sleep(
+                for: wasProvisioned ? .milliseconds(100) : .milliseconds(500)
+            )
+        }
+        if library.containerExists { return }
+        if let lastRefreshError { throw lastRefreshError }
+        throw LivecoreProviderError.extensionContainerUnavailable
+    }
+
+    // MARK: - Lock Screen
+
+    func applyLockScreen(videoURL: URL) async throws {
+        try await withMutation {
+            try await self.applyLockScreenLocked(videoURL: videoURL)
+        }
+    }
+
+    private func applyLockScreenLocked(videoURL: URL) async throws {
+        guard try isExtensionInstalled() else { throw LivecoreProviderError.extensionNotInstalled }
+        try await recycleExtensionLocked()
+
+        let previousItem = library.currentItem()
+        let beforeSettings = try await PrivateWallpaperSettings.captureSettings()
+        let previousSelection = try await PrivateWallpaperSettings.selection(
+            providerIDs: Self.knownProviderIDs
+        )
+
+        let item = try await library.prepareVideo(
+            at: videoURL,
+            inheritingDesktopFrom: previousItem
+        )
+        let ready = DistributedSignalWaiter(
+            name: LivecoreNotification.rendererReady,
+            object: item.id.uuidString
+        )
+        let failedItemRetired = DistributedSignalWaiter(
+            name: LivecoreNotification.rendererRetired,
+            object: item.id.uuidString
+        )
+        let previousItemWasSelected = previousSelection?.providerID == Self.providerID
+            && previousSelection?.itemID == previousItem?.id
+        let retired = previousItemWasSelected ? previousItem.map {
+            DistributedSignalWaiter(
+                name: LivecoreNotification.rendererRetired,
+                object: $0.id.uuidString
+            )
+        } : nil
+        var itemWasPublished = false
+
+        do {
+            // `prepareVideo` creates the library directory on a clean install.
+            // Store the restore point only after that succeeds.
+            let restorePoint: Data
+            if previousSelection == nil {
+                restorePoint = beforeSettings
+            } else if let inheritedBackup = PrivateWallpaperSettings.firstRestorableBackup(
+                from: backupDataCandidates(),
+                rejectingProviderIDs: Self.knownProviderIDs
+            ) {
+                restorePoint = inheritedBackup
+            } else {
+                restorePoint = try PrivateWallpaperSettings.fallbackBackup()
+            }
+            try restorePoint.write(to: library.lockScreenBackupURL, options: .atomic)
+            // Every legacy process was stopped during recycle and its only
+            // valid restore point now lives in the current container.
+            try purgeLegacyLibraries()
+            try library.publish(item)
+            itemWasPublished = true
+            try await PrivateWallpaperSettings.apply(item: item, providerID: Self.providerID)
+            guard try await selectionSettles(on: item.id, providerID: Self.providerID) else {
+                throw LivecoreProviderError.lockScreenSelectionRejected
+            }
+            notifyAssetsChanged()
+            guard await ready.wait(timeout: .seconds(8)) else {
+                throw LivecoreProviderError.lockScreenRendererUnavailable
+            }
+        } catch {
+            let operationError = error
+            do {
+                try await PrivateWallpaperSettings.restore(from: [beforeSettings])
+                if let previousItem {
+                    try library.publish(previousItem)
+                } else {
+                    try library.unpublish()
                 }
-                guard await waitForRenderer(item.id, since: activationDate, timeout: 10) else {
-                    throw LivecoreProviderError.rendererDidNotStart
+                notifyAssetsChanged()
+                let retiredAfterRollback = if itemWasPublished,
+                                              extensionProcessesAreRunning() {
+                    await failedItemRetired.wait(timeout: .seconds(7))
+                } else {
+                    true
                 }
-                LivecoreWallpaperLibrary.shared.removeObsoleteAssets(keeping: item)
-                queue.sync {
-                    unregisterObsoletePluginRecords(
-                        keeping: embeddedExtensionURL,
-                        includeAlternateProviders: true
-                    )
+                if retiredAfterRollback {
+                    library.discard(item)
                 }
             } catch {
-                let activationError = error
-                do {
-                    try await PrivateWallpaperSettings.restoreSnapshot(from: previousSettings)
-                    notifyWallpaperChanged()
-                    guard await waitForRollbackSelection(
-                        previousManagedConfiguration,
-                        timeout: 4
-                    ) else { throw LivecoreProviderError.wallpaperStoreChanged }
-                    restoreBackupFile(previousBackup, at: backupURL)
-                } catch {
-                    // Keep the newly published item and the original restore
-                    // point. Deleting them while macOS may still reference the
-                    // new UUID is exactly what produces a black Lock Screen.
-                    notifyWallpaperChanged()
-                    throw LivecoreProviderError.rollbackFailed(error.localizedDescription)
-                }
-                throw activationError
+                // The new selection may still be live. Keep its current marker
+                // and every asset rather than manufacturing a black wallpaper.
+                notifyAssetsChanged()
+                throw LivecoreProviderError.lockScreenRollbackFailed
             }
-            await mutationGate.leave()
-        } catch {
-            await mutationGate.leave()
-            throw error
+            throw operationError
         }
+
+        guard let previousItem, previousItem.id != item.id else { return }
+        let retiredAcknowledged = if let retired {
+            await retired.wait(timeout: .seconds(7))
+        } else {
+            false
+        }
+        if !previousItemWasSelected
+            || !extensionProcessesAreRunning()
+            || retiredAcknowledged {
+            library.discard(previousItem)
+        }
+    }
+
+    private func selectionSettles(
+        on expected: UUID,
+        providerID: String,
+        timeout: TimeInterval = 5
+    ) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        var consecutiveMatches = 0
+        repeat {
+            if try await PrivateWallpaperSettings.selectionMatches(
+                itemID: expected,
+                providerID: providerID
+            ) {
+                consecutiveMatches += 1
+                if consecutiveMatches == 3 { return true }
+            } else {
+                consecutiveMatches = 0
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        } while Date() < deadline
+        return false
     }
 
     func deactivateLockScreen() async throws {
-        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
-        await mutationGate.enter()
-        do {
-            try await deactivateLockScreenLocked()
-            await mutationGate.leave()
-        } catch {
-            await mutationGate.leave()
-            throw error
+        try await withMutation {
+            try await self.deactivateLockScreenLocked()
         }
     }
 
     private func deactivateLockScreenLocked() async throws {
-        guard #available(macOS 14.0, *) else { throw LivecoreProviderError.unsupportedSystem }
-        let backupURL = LivecoreWallpaperLibrary.shared.lockScreenBackupURL
-        let backup = try? Data(contentsOf: backupURL)
-        let hadManagedSelection = (try? await PrivateWallpaperSettings.hasAnyProvider(Self.knownProviderIDs)) == true
-        guard hadManagedSelection || backup != nil else {
-            try? LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
-            return
+        let selection = try await PrivateWallpaperSettings.selection(
+            providerIDs: Self.knownProviderIDs
+        )
+        guard let selection else { return }
+        let selectedItem: LivecoreWallpaperItem? = if selection.providerID == Self.providerID,
+                                                      let itemID = selection.itemID {
+            library.item(withID: itemID)
+        } else {
+            nil
         }
 
-        let before = try await PrivateWallpaperSettings.captureDesktopSettings()
-        let previousManagedConfiguration = (try? readStore())
-            .flatMap(selectedLivecoreDesktopConfiguration)
+        let retired = selection.itemID.map {
+            DistributedSignalWaiter(
+                name: LivecoreNotification.rendererRetired,
+                object: $0.uuidString
+            )
+        }
+        try await PrivateWallpaperSettings.restore(
+            from: backupDataCandidates(),
+            rejectingProviderIDs: Self.knownProviderIDs
+        )
+        guard try await selectionLeavesKnownProviders() else {
+            throw LivecoreProviderError.lockScreenSelectionRejected
+        }
 
+        removeBackupFiles()
+        try? library.unpublish()
+        notifyAssetsChanged()
+        let retiredAcknowledged = if let retired {
+            await retired.wait(timeout: .seconds(7))
+        } else {
+            false
+        }
+        if !extensionProcessesAreRunning() {
+            try purgeAllLibraries()
+        } else if retiredAcknowledged, let selectedItem {
+            library.discard(selectedItem)
+        }
+    }
+
+    private func selectionLeavesKnownProviders(timeout: TimeInterval = 5) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        var consecutiveMatches = 0
+        repeat {
+            if try await PrivateWallpaperSettings.selection(
+                providerIDs: Self.knownProviderIDs
+            ) == nil {
+                consecutiveMatches += 1
+                if consecutiveMatches == 3 { return true }
+            } else {
+                consecutiveMatches = 0
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        } while Date() < deadline
+        return false
+    }
+
+    // MARK: - Plumbing
+
+    private func notifyAssetsChanged() {
+        DistributedNotificationCenter.default().postNotificationName(
+            LivecoreNotification.assetsChanged,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+    }
+
+    private func withMutation<T: Sendable>(
+        _ operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        await mutationGate.enter()
         do {
-            try await PrivateWallpaperSettings.restoreDesktopSettings(from: backup)
-            notifyWallpaperChanged()
-            guard await waitForNoLivecoreSelection(timeout: 8) else {
-                throw LivecoreProviderError.lockScreenSelectionUnavailable
-            }
-            try LivecoreWallpaperLibrary.shared.setPlaybackEnabled(false)
-            try? fileManager.removeItem(at: backupURL)
-            LivecoreWallpaperLibrary.shared.clearRendererReadyMarker()
+            let result = try await operation()
+            await mutationGate.leave()
+            return result
         } catch {
-            let deactivationError = error
-            do {
-                try await PrivateWallpaperSettings.restoreSnapshot(from: before)
-                notifyWallpaperChanged()
-                guard await waitForRollbackSelection(
-                    previousManagedConfiguration,
-                    timeout: 4
-                ) else { throw LivecoreProviderError.wallpaperStoreChanged }
-                if hadManagedSelection {
-                    try LivecoreWallpaperLibrary.shared.setPlaybackEnabled(true)
-                }
-            } catch {
-                notifyWallpaperChanged()
-                throw LivecoreProviderError.rollbackFailed(error.localizedDescription)
-            }
-            throw deactivationError
+            await mutationGate.leave()
+            throw error
         }
     }
 
-    private func selectedLivecoreDesktopConfiguration(in root: [String: Any]) -> UUID? {
-        livecoreConfiguration(in: root, desktopOnly: true)
+    private func pluginRecords(for identifier: String) throws -> [PluginRecord] {
+        let output = try run("-m", "-A", "-D", "-v", "-i", identifier)
+        return output.split(separator: "\n").compactMap { line in
+            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
+            guard let path = fields.last.map(String.init), path.hasPrefix("/") else { return nil }
+            let first = line.trimmingCharacters(in: .whitespaces).first
+            let election = "+-!=?".contains(first ?? " ") ? first : nil
+            return PluginRecord(election: election, url: URL(fileURLWithPath: path))
+        }
     }
 
-    private func livecoreConfiguration(in value: Any?, desktopOnly: Bool) -> UUID? {
-        if let dictionary = value as? [String: Any] {
-            if let provider = dictionary["Provider"] as? String,
-               Self.knownProviderIDs.contains(provider),
-               let data = dictionary["Configuration"] as? Data,
-               let string = String(data: data, encoding: .utf8),
-               let id = UUID(uuidString: string) {
-                return id
-            }
-            if desktopOnly {
-                if let id = livecoreConfiguration(in: dictionary["Desktop"], desktopOnly: false)
-                    ?? livecoreConfiguration(in: dictionary["Linked"], desktopOnly: false) {
-                    return id
+    private func removeStalePluginRecords(keepEmbeddedCurrent: Bool) throws {
+        for identifier in Self.knownProviderIDs {
+            for record in try pluginRecords(for: identifier) {
+                if keepEmbeddedCurrent,
+                   identifier == Self.providerID,
+                   sameFile(record.url, embeddedExtensionURL) {
+                    continue
                 }
-                return dictionary.compactMap { key, nested -> UUID? in
-                    guard key != "Idle" && key != "SystemDefault" else { return nil }
-                    return livecoreConfiguration(in: nested, desktopOnly: true)
-                }.first
+                let removedExplicitly = (try? run("-r", record.url.path)) != nil
+                if let appURL = containingApplication(for: record.url) {
+                    if sameFile(appURL, Bundle.main.bundleURL) {
+                        guard removedExplicitly else {
+                            throw LivecoreProviderError.pluginKitFailed(
+                                "A legacy extension is still embedded in this Livecore app."
+                            )
+                        }
+                    } else {
+                        try runLaunchServices("-u", appURL.path)
+                    }
+                } else if !removedExplicitly {
+                    throw LivecoreProviderError.pluginKitFailed(
+                        "The stale extension at \(record.url.path) could not be unregistered."
+                    )
+                }
             }
-            return dictionary.values.compactMap {
-                livecoreConfiguration(in: $0, desktopOnly: false)
-            }.first
         }
-        if let array = value as? [Any] {
-            return array.compactMap { livecoreConfiguration(in: $0, desktopOnly: false) }.first
+
+        let staleRecords = try Self.knownProviderIDs.flatMap { identifier in
+            try pluginRecords(for: identifier).filter { record in
+                !(keepEmbeddedCurrent
+                    && identifier == Self.providerID
+                    && sameFile(record.url, embeddedExtensionURL))
+            }
+        }
+        guard staleRecords.isEmpty else {
+            throw LivecoreProviderError.pluginKitFailed(
+                "LaunchServices kept \(staleRecords.count) stale Livecore extension record(s)."
+            )
+        }
+    }
+
+    private func containingApplication(for extensionURL: URL) -> URL? {
+        var candidate = extensionURL.deletingLastPathComponent()
+        while candidate.path != "/" {
+            if candidate.pathExtension.caseInsensitiveCompare("app") == .orderedSame {
+                return candidate
+            }
+            candidate.deleteLastPathComponent()
         }
         return nil
     }
 
-    @available(macOS 14.0, *)
-    private func waitForStableSelection(_ itemID: UUID, timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        var stableReads = 0
-        while Date() < deadline {
-            let frameworkMatches = (try? await PrivateWallpaperSettings.selectionMatches(
-                itemID: itemID,
-                providerID: Self.providerID
-            )) == true
-            if frameworkMatches,
-               let root = try? readStore(),
-               selectedLivecoreDesktopConfiguration(in: root) == itemID {
-                stableReads += 1
-                if stableReads >= 8 { return true }
-            } else {
-                stableReads = 0
-            }
-            try? await Task.sleep(for: .milliseconds(250))
+    private func terminateExtensionProcesses() async -> Bool {
+        for identifier in Self.knownProviderIDs {
+            NSRunningApplication.runningApplications(
+                withBundleIdentifier: identifier
+            ).forEach { $0.terminate() }
         }
-        return false
+        if await waitForExtensionProcessesToExit(timeout: 2) { return true }
+        for identifier in Self.knownProviderIDs {
+            NSRunningApplication.runningApplications(
+                withBundleIdentifier: identifier
+            ).forEach { $0.forceTerminate() }
+        }
+        return await waitForExtensionProcessesToExit(timeout: 2)
     }
 
-    private func waitForRenderer(_ itemID: UUID, since date: Date, timeout: TimeInterval) async -> Bool {
+    private func waitForExtensionProcessesToExit(timeout: TimeInterval) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if LivecoreWallpaperLibrary.shared.rendererIsReady(for: itemID, since: date) { return true }
-            if let root = try? readStore(), selectedLivecoreDesktopConfiguration(in: root) != itemID { return false }
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-        return false
-    }
-
-    private func waitForSettingsModel(
-        _ itemID: UUID,
-        since date: Date,
-        timeout: TimeInterval
-    ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if LivecoreWallpaperLibrary.shared.settingsModelIsReady(for: itemID, since: date) {
-                return true
-            }
+        repeat {
+            if !extensionProcessesAreRunning() { return true }
             try? await Task.sleep(for: .milliseconds(100))
-        }
-        return false
+        } while Date() < deadline
+        return !extensionProcessesAreRunning()
     }
 
-    @available(macOS 14.0, *)
-    private func waitForNoLivecoreSelection(timeout: TimeInterval) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        var stableReads = 0
-        while Date() < deadline {
-            let frameworkIsClear = (try? await PrivateWallpaperSettings.hasAnyProvider(
-                Self.knownProviderIDs
-            )) == false
-            if frameworkIsClear,
-               let root = try? readStore(),
-               selectedLivecoreDesktopConfiguration(in: root) == nil {
-                stableReads += 1
-                if stableReads >= 6 { return true }
-            } else {
-                stableReads = 0
-            }
-            try? await Task.sleep(for: .milliseconds(200))
+    private func extensionProcessesAreRunning() -> Bool {
+        Self.knownProviderIDs.contains { identifier in
+            !NSRunningApplication.runningApplications(
+                withBundleIdentifier: identifier
+            ).isEmpty
         }
-        return false
     }
 
-    private func waitForRollbackSelection(
-        _ expectedConfiguration: UUID?,
-        timeout: TimeInterval
-    ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        var stableReads = 0
-        while Date() < deadline {
-            do {
-                let root = try readStore()
-                let actual = selectedLivecoreDesktopConfiguration(in: root)
-                if actual == expectedConfiguration {
-                    stableReads += 1
-                    if stableReads >= 4 { return true }
-                } else {
-                    stableReads = 0
-                }
-            } catch {
-                // A missing/corrupt store is unknown, never evidence that a
-                // rollback to an expected nil selection succeeded.
-                stableReads = 0
-            }
-            try? await Task.sleep(for: .milliseconds(200))
+    private var backupURLs: [URL] {
+        let home = fileManager.homeDirectoryForCurrentUser
+        var urls = [library.lockScreenBackupURL, library.legacyLockScreenBackupURL]
+        for identifier in Self.legacyProviderIDs {
+            let root = home
+                .appendingPathComponent(
+                    "Library/Containers/\(identifier)/Data/Documents",
+                    isDirectory: true
+                )
+                .appendingPathComponent(LivecoreLibraryFile.directoryName, isDirectory: true)
+            urls.append(root.appendingPathComponent(LivecoreLibraryFile.lockScreenBackup))
+            urls.append(root.appendingPathComponent("lock-screen-backup.plist"))
         }
-        return false
+        return urls
     }
 
-    private func readStore() throws -> [String: Any] {
-        guard fileManager.fileExists(atPath: storeURL.path) else {
-            throw LivecoreProviderError.wallpaperStoreUnavailable
-        }
-        let data = try Data(contentsOf: storeURL)
-        guard let root = try PropertyListSerialization.propertyList(
-            from: data,
-            format: nil
-        ) as? [String: Any] else { throw LivecoreProviderError.invalidWallpaperStore }
-        return root
+    private func backupDataCandidates() -> [Data] {
+        backupURLs.compactMap { try? Data(contentsOf: $0) }
     }
 
-    private func restoreBackupFile(_ data: Data?, at url: URL) {
-        if let data {
-            try? data.write(to: url, options: .atomic)
-        } else {
+    private func removeBackupFiles() {
+        for url in backupURLs where fileManager.fileExists(atPath: url.path) {
             try? fileManager.removeItem(at: url)
         }
     }
 
-    private func notifyWallpaperChanged() {
-        DistributedNotificationCenter.default().postNotificationName(
-            NSNotification.Name("com.apple.wallpaper.changed"),
-            object: nil,
-            userInfo: nil,
-            deliverImmediately: true
-        )
-        DistributedNotificationCenter.default().postNotificationName(
-            NSNotification.Name("com.livecore.app.assets-changed"),
-            object: nil,
-            userInfo: nil,
-            deliverImmediately: true
-        )
-        let darwinCenter = CFNotificationCenterGetDarwinNotifyCenter()
-        CFNotificationCenterPostNotification(
-            darwinCenter,
-            CFNotificationName("com.apple.wallpaper.changed" as CFString),
-            nil,
-            nil,
-            true
-        )
-        CFNotificationCenterPostNotification(
-            darwinCenter,
-            CFNotificationName("com.livecore.app.assets-changed" as CFString),
-            nil,
-            nil,
-            true
-        )
+    private func purgeAllLibraries() throws {
+        try library.purge()
+        try purgeLegacyLibraries()
     }
 
-    private func pluginRecords(for identifier: String) -> [PluginRecord] {
-        let result = runProcess("/usr/bin/pluginkit", ["-m", "-A", "-D", "-v", "-i", identifier])
-        guard result.status == 0 else { return [] }
-        return result.output.split(separator: "\n").compactMap { line in
-            let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
-            guard let path = fields.last.map(String.init), path.hasPrefix("/") else { return nil }
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            let first = trimmed.first
-            let election: Character? = ["+", "-", "!", "=", "?"].contains(first.map(String.init) ?? "")
-                ? first
-                : nil
-            return PluginRecord(election: election, url: URL(fileURLWithPath: path))
+    private func purgeLegacyLibraries() throws {
+        let home = fileManager.homeDirectoryForCurrentUser
+        for identifier in Self.legacyProviderIDs {
+            let root = home
+                .appendingPathComponent(
+                    "Library/Containers/\(identifier)/Data/Documents",
+                    isDirectory: true
+                )
+                .appendingPathComponent(LivecoreLibraryFile.directoryName, isDirectory: true)
+            if fileManager.fileExists(atPath: root.path) {
+                try fileManager.removeItem(at: root)
+            }
         }
     }
 
@@ -1055,45 +1008,41 @@ final class WallpaperStoreManager: @unchecked Sendable {
             == rhs.resolvingSymlinksInPath().standardizedFileURL
     }
 
-    /// ExtensionKit may keep launching a previously built copy when several
-    /// registrations share one bundle identifier. Keep the verified embedded
-    /// copy registered first, then remove only obsolete paths so there is never
-    /// a provider-registration gap.
-    private func unregisterObsoletePluginRecords(
-        keeping currentURL: URL,
-        includeAlternateProviders: Bool
-    ) {
-        for record in pluginRecords(for: Self.providerID)
-        where !sameFile(record.url, currentURL) {
-            _ = runProcess("/usr/bin/pluginkit", ["-r", record.url.path])
-        }
-        guard includeAlternateProviders else { return }
-        for identifier in Self.knownProviderIDs where identifier != Self.providerID {
-            _ = runProcess("/usr/bin/pluginkit", ["-e", "ignore", "-i", identifier])
-            for record in pluginRecords(for: identifier) {
-                _ = runProcess("/usr/bin/pluginkit", ["-r", record.url.path])
-            }
-        }
+    @discardableResult
+    private func run(_ arguments: String...) throws -> String {
+        try runProcess(
+            executable: "/usr/bin/pluginkit",
+            arguments: arguments
+        )
     }
 
     @discardableResult
-    private func runProcess(_ path: String, _ arguments: [String]) -> ProcessResult {
+    private func runLaunchServices(_ arguments: String...) throws -> String {
+        try runProcess(
+            executable: "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+                + "LaunchServices.framework/Support/lsregister",
+            arguments: arguments
+        )
+    }
+
+    private func runProcess(executable: String, arguments: [String]) throws -> String {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
+        process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
-        do {
-            try process.run()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            return ProcessResult(
-                status: process.terminationStatus,
-                output: String(data: data, encoding: .utf8) ?? ""
+        try process.run()
+        let output = String(
+            data: pipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        ) ?? ""
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw LivecoreProviderError.pluginKitFailed(
+                output.trimmingCharacters(in: .whitespacesAndNewlines)
             )
-        } catch {
-            return ProcessResult(status: -1, output: error.localizedDescription)
         }
+        return output
     }
 }

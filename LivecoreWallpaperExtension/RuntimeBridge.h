@@ -40,5 +40,4 @@ NS_ASSUME_NONNULL_BEGIN
 id _Nullable LCCreateRemoteContext(CALayer *rootLayer, uint32_t displayID);
 void LCReleaseRemoteContext(id context);
 id _Nullable LCCreateWallpaperSnapshot(CGImageRef image);
-NSString *LCLoadedCodeBuildIdentifier(void);
 NS_ASSUME_NONNULL_END

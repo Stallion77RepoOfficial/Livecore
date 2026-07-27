@@ -15,6 +15,8 @@
 		704471F0C0B357A17C096F9A /* LivecoreWallpaperExtension.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 255316117574CB68DA99F8B0 /* LivecoreWallpaperExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		DAED500484ACE99CE0DC1A69 /* DashboardWindowController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 67787413D04C910763363708 /* DashboardWindowController.swift */; };
 		AA1122334455667788990011 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BB1122334455667788990022 /* Assets.xcassets */; };
+		5A1D00000000000000000021 /* LivecoreLibraryFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A1D00000000000000000011 /* LivecoreLibraryFormat.swift */; };
+		5A1D00000000000000000031 /* LivecoreLibraryFormat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5A1D00000000000000000011 /* LivecoreLibraryFormat.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -56,6 +58,7 @@
 		DDF1C44BA78129E3D1411028 /* LivecoreWallpaperExtension.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = LivecoreWallpaperExtension.entitlements; sourceTree = "<group>"; };
 		E4DA6FC9CE599655B91907D7 /* Livecore.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Livecore.entitlements; sourceTree = "<group>"; };
 		BB1122334455667788990022 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		5A1D00000000000000000011 /* LivecoreLibraryFormat.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LivecoreLibraryFormat.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -80,9 +83,18 @@
 			path = LivecoreWallpaperExtension;
 			sourceTree = "<group>";
 		};
+		5A1D00000000000000000041 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				5A1D00000000000000000011 /* LivecoreLibraryFormat.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
 		B271FDAA0FE522844C6475A9 = {
 			isa = PBXGroup;
 			children = (
+				5A1D00000000000000000041 /* Shared */,
 				CBF018829E7189D173AFA3AF /* Livecore */,
 				A1382369A956486510F00FF5 /* LivecoreWallpaperExtension */,
 				5705C74900D61CB1BBA1A724 /* Products */,
@@ -201,6 +213,7 @@
 				DAED500484ACE99CE0DC1A69 /* DashboardWindowController.swift in Sources */,
 				61325E2F7D28545D827D56E0 /* LivecoreWallpaperProvider.swift in Sources */,
 				5BADCD87088C4F86B3E55311 /* PrivateWallpaperSettings.swift in Sources */,
+				5A1D00000000000000000021 /* LivecoreLibraryFormat.swift in Sources */,
 				27864213D4D8AE78F5811673 /* main.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -210,6 +223,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				3828FA2C7B9F94B0911356A4 /* LivecoreWallpaperExtension.swift in Sources */,
+				5A1D00000000000000000031 /* LivecoreLibraryFormat.swift in Sources */,
 				04AD7454600A6F4C21A373A1 /* RuntimeBridge.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -288,6 +302,7 @@
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = "";
+				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -306,7 +321,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -429,6 +444,7 @@
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = "";
+				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -441,7 +457,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -470,7 +486,7 @@
 					"@executable_path/../../../../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "com.livecore.app.wallpaper-extension.debug";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.livecore.app.wallpaper-extension";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
 				SWIFT_OBJC_BRIDGING_HEADER = LivecoreWallpaperExtension/RuntimeBridge.h;

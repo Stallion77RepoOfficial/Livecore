@@ -101,10 +101,13 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     override init() {
         super.init()
         assetObserver = DistributedNotificationCenter.default().addObserver(
-            forName: NSNotification.Name("com.livecore.app.assets-changed"),
+            forName: LivecoreNotification.assetsChanged,
             object: nil,
-            queue: nil
-        ) { [weak self] _ in self?.pushSettings() }
+            queue: .main
+        ) { [weak self] _ in
+            self?.renderer.announceReadiness(for: SharedWallpaperLibrary.current()?.id)
+            self?.pushSettings()
+        }
     }
 
     deinit {
@@ -120,28 +123,15 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     ) {
         guard let configuration = requestString(named: "configuration", in: request),
               let id = UUID(uuidString: configuration),
-              let item = SharedWallpaperLibrary.item(id)
+              let item = SharedWallpaperLibrary.item(id),
+              let surface = requestSurface(identifier, request)
         else {
-            reply(nil, LivecoreExtensionError.missingItem)
+            reply(nil, LivecoreExtensionError.malformedRequest)
             return
         }
-        let destination = requestDestination(request)
-        let key = SurfaceKey(
-            identifier: wallpaperIdentifier(identifier),
-            displayID: destination.displayID
-        )
-        let isPreview = requestValue(named: "isPreview", in: request) as? Bool ?? false
-        let mode = requestValue(named: "presentationMode", in: request).map(enumCaseName) ?? "default"
-        renderer.acquire(
-            key: key,
-            item: item,
-            size: destination.size,
-            scale: destination.scale,
-            displayID: destination.displayID,
-            isPreview: isPreview,
-            initialMode: mode,
-            reply: reply
-        )
+        let mode = requestValue(named: "presentationMode", in: request)
+            .map(enumCaseName) ?? "default"
+        renderer.acquire(surface: surface, item: item, initialMode: mode, reply: reply)
     }
 
     func update(
@@ -149,14 +139,15 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         request: Any?,
         reply: @escaping @Sendable ((any Error)?) -> Void
     ) {
-        let destination = requestDestination(request)
-        let key = SurfaceKey(
-            identifier: wallpaperIdentifier(identifier),
-            displayID: destination.displayID
-        )
-        let mode = requestValue(named: "presentationMode", in: request).map(enumCaseName) ?? "default"
-        let activity = requestValue(named: "activityState", in: request).map(enumCaseName) ?? "active"
-        renderer.update(key: key, presentationMode: mode, activityState: activity)
+        guard let surface = requestSurface(identifier, request) else {
+            reply(LivecoreExtensionError.malformedRequest)
+            return
+        }
+        let mode = requestValue(named: "presentationMode", in: request)
+            .map(enumCaseName) ?? "default"
+        let activity = requestValue(named: "activityState", in: request)
+            .map(enumCaseName) ?? "active"
+        renderer.update(surface: surface, presentationMode: mode, activityState: activity)
         reply(nil)
     }
 
@@ -164,7 +155,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         withId identifier: Any?,
         reply: @escaping @Sendable ((any Error)?) -> Void
     ) {
-        renderer.invalidate(identifier: wallpaperIdentifier(identifier))
+        renderer.invalidate(identifier: findUUID(in: identifier))
         reply(nil)
     }
 
@@ -172,10 +163,11 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         withId identifier: Any?,
         reply: @escaping @Sendable (Any?, (any Error)?) -> Void
     ) {
-        let configuration = requestString(named: "configuration", in: identifier)
-        let item = configuration.flatMap(UUID.init(uuidString:)).flatMap(SharedWallpaperLibrary.item)
-            ?? SharedWallpaperLibrary.current()
-        guard let item, let image = SharedWallpaperLibrary.thumbnail(item),
+        let requested = requestString(named: "configuration", in: identifier)
+            .flatMap(UUID.init(uuidString:))
+            .flatMap(SharedWallpaperLibrary.item)
+        guard let item = requested ?? SharedWallpaperLibrary.current(),
+              let image = SharedWallpaperLibrary.thumbnail(item),
               let snapshot = LCCreateWallpaperSnapshot(image)
         else {
             reply(nil, LivecoreExtensionError.snapshotUnavailable)
@@ -187,13 +179,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
     func provideSettingsViewModels(
         withContentTypes _: Any?,
         reply: @escaping @Sendable (Any?, (any Error)?) -> Void
-    ) {
-        let models = SettingsModelBridge.make()
-        if models != nil, let item = SharedWallpaperLibrary.current() {
-            SharedWallpaperLibrary.markSettingsReady(item.id)
-        }
-        reply(models, nil)
-    }
+    ) { reply(SettingsModelBridge.make(), nil) }
 
     func selectedChoicesDidChange(
         for _: Any?,
@@ -222,6 +208,7 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
         reply: @escaping @Sendable ((any Error)?) -> Void
     ) { reply(nil) }
 
+    // Livecore's videos are always local, so nothing is ever downloaded.
     func isChoiceDownloaded(
         with _: Any?,
         reply: @escaping @Sendable (NSNumber?, (any Error)?) -> Void
@@ -273,20 +260,29 @@ final class WallpaperXPCHandler: NSObject, WallpaperExtensionXPCProtocol {
 }
 
 private enum LivecoreExtensionError: Int, Error {
-    case missingItem = 1
+    case malformedRequest = 1
     case rendererUnavailable = 2
     case snapshotUnavailable = 3
 }
 
-private struct SurfaceKey: Hashable {
-    let identifier: String
+/// The surface WallpaperAgent asked about: which wallpaper, on which display,
+/// at what size.
+private struct RequestSurface: Hashable {
+    let identifier: UUID
     let displayID: UInt32
-}
-
-private struct RequestDestination {
     let size: CGSize
     let scale: CGFloat
+    let isPreview: Bool
+
+    var key: SurfaceKey {
+        SurfaceKey(identifier: identifier, displayID: displayID, isPreview: isPreview)
+    }
+}
+
+private struct SurfaceKey: Hashable {
+    let identifier: UUID
     let displayID: UInt32
+    let isPreview: Bool
 }
 
 /// Latched lock-screen state. WallpaperAgent keeps sending presentation-mode
@@ -314,14 +310,15 @@ private final class LivecoreRemoteRenderer: @unchecked Sendable {
     static let shared = LivecoreRemoteRenderer()
 
     private var sessions: [SurfaceKey: RenderSession] = [:]
-    private var invalidationTokens: [SurfaceKey: UUID] = [:]
-    private let queue = DispatchQueue(label: "\(Bundle.main.bundleIdentifier ?? "com.livecore.app").extension-lifecycle", qos: .default)
+    /// A replaced context remains alive until WallpaperAgent invalidates it.
+    private var supersededSessions: [SurfaceKey: [RenderSession]] = [:]
+    private var retirementCounts: [UUID: Int] = [:]
 
     private init() {
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("com.apple.screenIsLocked"),
             object: nil,
-            queue: nil
+            queue: .main
         ) { [weak self] _ in
             ScreenLockState.set(true)
             self?.updateAll(presentationMode: "locked", activityState: "active")
@@ -329,7 +326,7 @@ private final class LivecoreRemoteRenderer: @unchecked Sendable {
         DistributedNotificationCenter.default().addObserver(
             forName: NSNotification.Name("com.apple.screenIsUnlocked"),
             object: nil,
-            queue: nil
+            queue: .main
         ) { [weak self] _ in
             ScreenLockState.set(false)
             self?.updateAll(presentationMode: "default", activityState: "active")
@@ -337,176 +334,314 @@ private final class LivecoreRemoteRenderer: @unchecked Sendable {
     }
 
     func acquire(
-        key: SurfaceKey,
-        item: SharedWallpaperItem,
-        size: CGSize,
-        scale: CGFloat,
-        displayID: UInt32,
-        isPreview: Bool,
+        surface: RequestSurface,
+        item: LivecoreWallpaperItem,
         initialMode: String,
         reply: @escaping @Sendable (Any?, (any Error)?) -> Void
     ) {
-        queue.async {
-            self.invalidationTokens.removeValue(forKey: key)
-            if let session = self.sessions[key],
-               session.item.id == item.id,
-               session.isPreview == isPreview,
-               session.matches(size: size, scale: scale) {
-                session.update(presentationMode: initialMode, activityState: "active")
-                SharedWallpaperLibrary.markRendererReady(item.id)
+        DispatchQueue.main.async {
+            if let session = self.sessions[surface.key],
+               session.matches(item: item, isPreview: surface.isPreview) {
+                session.update(
+                    surface: surface,
+                    presentationMode: initialMode,
+                    activityState: "active"
+                )
                 reply(session.context, nil)
+                self.postReadinessIfHealthy(session)
                 return
             }
-            guard let session = RenderSession(
-                item: item,
-                size: size,
-                scale: scale,
-                displayID: displayID,
-                isPreview: isPreview
-            ) else {
+            guard let session = RenderSession(surface: surface, item: item) else {
                 reply(nil, LivecoreExtensionError.rendererUnavailable)
                 return
             }
-            let old = self.sessions.updateValue(session, forKey: key)
-            old?.invalidate()
-            session.update(presentationMode: initialMode, activityState: "active")
-            SharedWallpaperLibrary.markRendererReady(item.id)
+            if let previous = self.sessions.updateValue(session, forKey: surface.key) {
+                self.supersededSessions[surface.key, default: []].append(previous)
+            }
+            session.update(
+                surface: surface,
+                presentationMode: initialMode,
+                activityState: "active"
+            )
             reply(session.context, nil)
+            self.postReadinessIfHealthy(session)
         }
     }
 
-    func update(key: SurfaceKey, presentationMode: String, activityState: String) {
-        queue.async {
-            if let session = self.sessions[key] {
-                session.update(presentationMode: presentationMode, activityState: activityState)
-            } else {
-                self.sessions.values
-                    .filter { $0.displayID == key.displayID && !$0.isPreview }
-                    .forEach { $0.update(presentationMode: presentationMode, activityState: activityState) }
+    func update(surface: RequestSurface, presentationMode: String, activityState: String) {
+        DispatchQueue.main.async {
+            if let session = self.sessions[surface.key] {
+                session.update(
+                    surface: surface,
+                    presentationMode: presentationMode,
+                    activityState: activityState
+                )
+                self.postReadinessIfHealthy(session)
+                return
+            }
+
+            // Update variants may omit directDisplayID or isPreview. Preserve
+            // the acquired identity while applying their new geometry.
+            let candidates = self.sessions.filter { key, _ in
+                key.identifier == surface.identifier
+                    && (surface.displayID == 0 || key.displayID == surface.displayID)
+            }
+            for (key, session) in candidates {
+                let adjusted = RequestSurface(
+                    identifier: key.identifier,
+                    displayID: key.displayID,
+                    size: surface.size,
+                    scale: surface.scale,
+                    isPreview: key.isPreview
+                )
+                session.update(
+                    surface: adjusted,
+                    presentationMode: presentationMode,
+                    activityState: activityState
+                )
+                self.postReadinessIfHealthy(session)
             }
         }
     }
 
     func updateAll(presentationMode: String, activityState: String) {
-        queue.async {
-            self.sessions.values.filter { !$0.isPreview }.forEach {
-                $0.update(presentationMode: presentationMode, activityState: activityState)
+        DispatchQueue.main.async {
+            let allSessions = Array(self.sessions.values)
+                + self.supersededSessions.values.flatMap { $0 }
+            allSessions.filter { !$0.isPreview }.forEach {
+                $0.updatePlayback(
+                    presentationMode: presentationMode,
+                    activityState: activityState
+                )
             }
         }
     }
 
-    func invalidate(identifier: String) {
-        queue.async {
-            let keys = self.sessions.keys.filter { $0.identifier == identifier }
-            for key in keys {
-                let token = UUID()
-                self.invalidationTokens[key] = token
-                self.queue.asyncAfter(deadline: .now() + 1) {
-                    guard self.invalidationTokens[key] == token else { return }
-                    self.invalidationTokens.removeValue(forKey: key)
-                    self.sessions.removeValue(forKey: key)?.invalidate()
+    func announceReadiness(for itemID: UUID?) {
+        DispatchQueue.main.async {
+            guard let itemID,
+                  let session = self.sessions.values.first(where: {
+                      $0.itemID == itemID && !$0.isPreview && $0.isReady
+                  })
+            else { return }
+            self.postReadinessIfHealthy(session)
+        }
+    }
+
+    func invalidate(identifier: UUID?) {
+        DispatchQueue.main.async {
+            if let identifier {
+                var oldestGeneration: [RenderSession] = []
+                let keys = self.supersededSessions.keys.filter {
+                    $0.identifier == identifier
                 }
+                for key in keys {
+                    guard var pending = self.supersededSessions[key],
+                          !pending.isEmpty
+                    else { continue }
+                    oldestGeneration.append(pending.removeFirst())
+                    if pending.isEmpty {
+                        self.supersededSessions.removeValue(forKey: key)
+                    } else {
+                        self.supersededSessions[key] = pending
+                    }
+                }
+                if !oldestGeneration.isEmpty {
+                    self.retire(oldestGeneration)
+                    return
+                }
+
+                let activeKeys = self.sessions.keys.filter { $0.identifier == identifier }
+                let active = activeKeys.compactMap { self.sessions.removeValue(forKey: $0) }
+                self.retire(active)
+                return
+            }
+
+            let superseded = self.supersededSessions.values.flatMap { $0 }
+            self.supersededSessions.removeAll()
+            let keys = Array(self.sessions.keys)
+            let active = keys.compactMap { self.sessions.removeValue(forKey: $0) }
+            self.retire(superseded + active)
+        }
+    }
+
+    private func retire(_ retiring: [RenderSession]) {
+        for session in retiring {
+            retirementCounts[session.itemID, default: 0] += 1
+            session.invalidate { [weak self] in
+                self?.finishRetirement(of: session.itemID)
             }
         }
+    }
+
+    private func finishRetirement(of itemID: UUID) {
+        let remaining = max(0, (retirementCounts[itemID] ?? 1) - 1)
+        if remaining == 0 {
+            retirementCounts.removeValue(forKey: itemID)
+        } else {
+            retirementCounts[itemID] = remaining
+        }
+        guard remaining == 0,
+              !sessions.values.contains(where: { $0.itemID == itemID }),
+              !supersededSessions.values.joined().contains(where: { $0.itemID == itemID })
+        else { return }
+        DistributedNotificationCenter.default().postNotificationName(
+            LivecoreNotification.rendererRetired,
+            object: itemID.uuidString,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+    }
+
+    private func postReadinessIfHealthy(_ session: RenderSession) {
+        guard !session.isPreview, session.isReady else { return }
+        DistributedNotificationCenter.default().postNotificationName(
+            LivecoreNotification.rendererReady,
+            object: session.itemID.uuidString,
+            userInfo: nil,
+            deliverImmediately: true
+        )
     }
 }
 
 private final class RenderSession {
-    let item: SharedWallpaperItem
     let context: AnyObject
-    let displayID: UInt32
     let isPreview: Bool
-    let renderSize: CGSize
-    let renderScale: CGFloat
 
+    var itemID: UUID { item.id }
+    var isHealthy: Bool { !invalidated && pump.isHealthy }
+    var isReady: Bool { isHealthy }
+
+    private var surface: RequestSurface
+    private let item: LivecoreWallpaperItem
+    private let rootLayer: CALayer
     private let pump: SampleBufferPump
     private var invalidated = false
+    private var contextReleased = false
+    private var invalidationCompletions: [() -> Void] = []
 
-    init?(
-        item: SharedWallpaperItem,
-        size: CGSize,
-        scale: CGFloat,
-        displayID: UInt32,
-        isPreview: Bool
-    ) {
-        guard let videoURL = SharedWallpaperLibrary.videoURL(item),
-              let fallback = isPreview
-                ? SharedWallpaperLibrary.thumbnail(item)
-                : SharedWallpaperLibrary.desktopImage(item, displayID: displayID)
+    init?(surface: RequestSurface, item: LivecoreWallpaperItem) {
+        // The live surface paints the previous Desktop picture while unlocked.
+        // Settings previews show the video's poster instead.
+        guard let playbackPlaceholder = SharedWallpaperLibrary.thumbnail(item),
+              let still = surface.isPreview
+                ? playbackPlaceholder
+                : SharedWallpaperLibrary.desktopStill(item, displayID: surface.displayID)
         else { return nil }
 
-        let renderSize = size.width > 0 && size.height > 0
-            ? size
-            : CGSize(width: 2560, height: 1440)
-        let renderScale = scale > 0 ? scale : 2
         let root = CALayer()
-        root.frame = CGRect(origin: .zero, size: renderSize)
-        root.contentsScale = renderScale
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        root.bounds = CGRect(origin: .zero, size: surface.size)
+        root.frame = CGRect(origin: .zero, size: surface.size)
+        root.contentsScale = surface.scale
         root.backgroundColor = NSColor.clear.cgColor
-        guard let pump = SampleBufferPump(rootLayer: root, videoURL: videoURL, stillImage: fallback),
-              let context = LCCreateRemoteContext(root, displayID) as AnyObject?
-        else { return nil }
+        CATransaction.commit()
+        guard let pump = SampleBufferPump(
+            rootLayer: root,
+            videoURL: SharedWallpaperLibrary.videoURL(item),
+            stillImage: still,
+            playbackPlaceholderImage: playbackPlaceholder
+        ), let context = LCCreateRemoteContext(root, surface.displayID) as AnyObject? else {
+            return nil
+        }
 
+        self.surface = surface
         self.item = item
+        self.isPreview = surface.isPreview
         self.context = context
-        self.displayID = displayID
-        self.isPreview = isPreview
-        self.renderSize = renderSize
-        self.renderScale = renderScale
+        self.rootLayer = root
         self.pump = pump
     }
 
-    func matches(size: CGSize, scale: CGFloat) -> Bool {
-        let candidateSize = size.width > 0 && size.height > 0
-            ? size
-            : CGSize(width: 2560, height: 1440)
-        let candidateScale = scale > 0 ? scale : 2
-        return abs(renderSize.width - candidateSize.width) < 0.5
-            && abs(renderSize.height - candidateSize.height) < 0.5
-            && abs(renderScale - candidateScale) < 0.01
+    func matches(item: LivecoreWallpaperItem, isPreview: Bool) -> Bool {
+        self.item.id == item.id && self.isPreview == isPreview
     }
 
-    func update(presentationMode: String, activityState: String) {
+    func update(surface: RequestSurface, presentationMode: String, activityState: String) {
+        guard !invalidated else { return }
+        resize(to: surface)
+        updatePlayback(presentationMode: presentationMode, activityState: activityState)
+    }
+
+    func updatePlayback(presentationMode: String, activityState: String) {
         guard !invalidated else { return }
         if presentationMode == "locked" { ScreenLockState.set(true) }
-        // While the screen is locked, keep playing even if WallpaperAgent
-        // reports an idle activity state or reverts the presentation mode;
-        // otherwise the wallpaper degrades to a still after a few minutes.
-        let shouldPlay = SharedWallpaperLibrary.playbackEnabled()
-            && (isPreview
-                ? activityState == "active"
-                : presentationMode == "locked" || ScreenLockState.isLocked)
+        let shouldPlay = isPreview
+            ? activityState == "active"
+            : presentationMode == "locked" || ScreenLockState.isLocked
         if shouldPlay { pump.play() } else { pump.showStill() }
     }
 
-    func invalidate() {
+    func invalidate(completion: @escaping () -> Void) {
+        invalidationCompletions.append(completion)
         guard !invalidated else { return }
         invalidated = true
-        pump.stop()
-        LCReleaseRemoteContext(context)
+        pump.stop { [self] in
+            guard !contextReleased else { return }
+            contextReleased = true
+            LCReleaseRemoteContext(context)
+            let completions = invalidationCompletions
+            invalidationCompletions.removeAll()
+            completions.forEach { $0() }
+        }
     }
 
-    deinit { invalidate() }
+    private func resize(to updated: RequestSurface) {
+        let sizeChanged = abs(surface.size.width - updated.size.width) >= 0.5
+            || abs(surface.size.height - updated.size.height) >= 0.5
+        let scaleChanged = abs(surface.scale - updated.scale) >= 0.01
+        surface = updated
+        guard sizeChanged || scaleChanged else { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        rootLayer.bounds = CGRect(origin: .zero, size: updated.size)
+        rootLayer.frame = CGRect(origin: .zero, size: updated.size)
+        rootLayer.contentsScale = updated.scale
+        CATransaction.commit()
+        pump.resize(to: rootLayer.bounds, scale: updated.scale)
+    }
 }
 
 private final class SampleBufferPump: @unchecked Sendable {
-    private let displayLayer: AVSampleBufferDisplayLayer
-    private let renderer: AVSampleBufferVideoRenderer
+    private let rootLayer: CALayer
+    private var displayLayer: AVSampleBufferDisplayLayer
+    private var renderer: AVSampleBufferVideoRenderer
     private let timebase: CMTimebase
     private let asset: AVURLAsset
     private let stillBuffer: CMSampleBuffer
-    private let decodeQueue = DispatchQueue(label: "\(Bundle.main.bundleIdentifier ?? "com.livecore.app").video-decoder", qos: .default)
+    private let playbackPlaceholderBuffer: CMSampleBuffer
+    private let decodeQueue = DispatchQueue(label: "com.livecore.app.video-decoder", qos: .userInitiated)
+    private let attemptGroup = DispatchGroup()
     private let stateLock = NSLock()
     private let renderLock = NSLock()
     private var token: UUID?
-    private var reader: AVAssetReader?
     private var playbackRequested = false
     private var retryAttempt = 0
     private var playbackGeneration: UInt64 = 0
+    private var stopped = false
 
-    init?(rootLayer: CALayer, videoURL: URL, stillImage: CGImage) {
+    var isHealthy: Bool {
+        stateLock.lock()
+        let isStopped = stopped
+        stateLock.unlock()
+        renderLock.lock()
+        let rendererFailed = renderer.status == .failed
+        renderLock.unlock()
+        return !isStopped && !rendererFailed
+    }
+
+    init?(
+        rootLayer: CALayer,
+        videoURL: URL,
+        stillImage: CGImage,
+        playbackPlaceholderImage: CGImage
+    ) {
         let asset = AVURLAsset(url: videoURL)
-        guard let stillBuffer = makeStillSampleBuffer(from: stillImage) else { return nil }
+        guard let stillBuffer = makeStillSampleBuffer(from: stillImage),
+              let playbackPlaceholderBuffer = makeStillSampleBuffer(from: playbackPlaceholderImage)
+        else { return nil }
 
         let layer = AVSampleBufferDisplayLayer()
         layer.frame = rootLayer.bounds
@@ -525,11 +660,13 @@ private final class SampleBufferPump: @unchecked Sendable {
         CMTimebaseSetRate(timebase, rate: 0)
         layer.controlTimebase = timebase
 
+        self.rootLayer = rootLayer
         self.displayLayer = layer
         self.renderer = layer.sampleBufferRenderer
         self.timebase = timebase
         self.asset = asset
         self.stillBuffer = stillBuffer
+        self.playbackPlaceholderBuffer = playbackPlaceholderBuffer
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -540,128 +677,227 @@ private final class SampleBufferPump: @unchecked Sendable {
 
     func play() {
         stateLock.lock()
-        if !playbackRequested { playbackGeneration &+= 1 }
-        playbackRequested = true
-        if token != nil {
+        guard !stopped else {
             stateLock.unlock()
             return
         }
-        let newToken = UUID()
-        let generation = playbackGeneration
-        token = newToken
-        stateLock.unlock()
-
-        startAttempt(newToken, generation: generation)
-    }
-
-    private func startAttempt(_ attemptToken: UUID, generation: UInt64) {
-        renderLock.lock()
-        guard isCurrent(attemptToken, generation: generation) else {
-            renderLock.unlock()
+        if !playbackRequested {
+            playbackGeneration &+= 1
+            retryAttempt = 0
+        }
+        playbackRequested = true
+        guard token == nil else {
+            stateLock.unlock()
             return
         }
-        renderer.flush()
-        CMTimebaseSetTime(timebase, time: .zero)
-        CMTimebaseSetRate(timebase, rate: 1)
-        renderLock.unlock()
-        Task.detached(priority: .userInitiated) { [weak self] in
-            guard let self else { return }
-            guard let track = try? await self.asset.loadTracks(withMediaType: .video).first,
-                  self.isCurrent(attemptToken, generation: generation) else {
-                self.finishAttempt(attemptToken, generation: generation, retry: true)
-                return
-            }
-            let trackDuration = (try? await track.load(.timeRange))?.duration ?? .invalid
-            self.decodeQueue.async { [weak self] in
-                self?.decodeLoop(
-                    track: track,
-                    trackDuration: trackDuration,
-                    token: attemptToken,
-                    generation: generation
-                )
-            }
-        }
+        let attempt = UUID()
+        let generation = playbackGeneration
+        token = attempt
+        stateLock.unlock()
+
+        startAttempt(attempt, generation: generation)
     }
 
     func showStill() {
-        cancelDecode()
+        cancelPlayback()
+        guard !isStopped else { return }
         renderLock.lock()
         CMTimebaseSetRate(timebase, rate: 0)
         renderer.flush()
         markDisplayImmediately(stillBuffer)
         renderer.enqueue(stillBuffer)
-        CATransaction.flush()
         renderLock.unlock()
     }
 
-    func stop() {
-        cancelDecode()
+    func resize(to bounds: CGRect, scale: CGFloat) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        displayLayer.frame = bounds
+        displayLayer.contentsScale = scale
+        CATransaction.commit()
+    }
+
+    func stop(completion: @escaping () -> Void) {
+        stateLock.lock()
+        guard !stopped else {
+            stateLock.unlock()
+            attemptGroup.notify(queue: .main, execute: completion)
+            return
+        }
+        stopped = true
+        playbackGeneration &+= 1
+        playbackRequested = false
+        retryAttempt = 0
+        token = nil
+        stateLock.unlock()
+
         renderLock.lock()
         CMTimebaseSetRate(timebase, rate: 0)
         renderer.flush(removingDisplayedImage: true)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         displayLayer.removeFromSuperlayer()
+        CATransaction.commit()
         renderLock.unlock()
+        attemptGroup.notify(queue: .main, execute: completion)
     }
 
-    private func cancelDecode() {
+    private var isStopped: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return stopped
+    }
+
+    private func cancelPlayback() {
         stateLock.lock()
         playbackGeneration &+= 1
         playbackRequested = false
         retryAttempt = 0
         token = nil
-        let activeReader = reader
-        reader = nil
         stateLock.unlock()
-        activeReader?.cancelReading()
     }
 
-    private func isCurrent(_ candidate: UUID) -> Bool {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return token == candidate
+    private func startAttempt(_ attempt: UUID, generation: UInt64) {
+        guard isCurrent(attempt, generation: generation) else { return }
+        renderLock.lock()
+        renderer.flush()
+        markDisplayImmediately(playbackPlaceholderBuffer)
+        renderer.enqueue(playbackPlaceholderBuffer)
+        CMTimebaseSetTime(timebase, time: .zero)
+        CMTimebaseSetRate(timebase, rate: 1)
+        renderLock.unlock()
+
+        attemptGroup.enter()
+        Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+            guard let track = try? await self.asset.loadTracks(withMediaType: .video).first,
+                  let duration = try? await track.load(.timeRange).duration,
+                  self.isCurrent(attempt, generation: generation)
+            else {
+                self.finishAttempt(attempt, generation: generation, retry: true)
+                self.attemptGroup.leave()
+                return
+            }
+            self.decodeQueue.async {
+                self.decodeLoop(
+                    track: track,
+                    trackDuration: duration,
+                    token: attempt,
+                    generation: generation
+                )
+                self.attemptGroup.leave()
+            }
+        }
     }
 
     private func isCurrent(_ candidate: UUID, generation: UInt64) -> Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return token == candidate && playbackGeneration == generation && playbackRequested
+        return !stopped
+            && playbackRequested
+            && token == candidate
+            && playbackGeneration == generation
     }
 
-    private func notePlaybackProgress(_ candidate: UUID) {
+    private func isGenerationCurrent(_ generation: UInt64) -> Bool {
         stateLock.lock()
-        if token == candidate { retryAttempt = 0 }
+        defer { stateLock.unlock() }
+        return playbackGeneration == generation && playbackRequested && !stopped
+    }
+
+    private func notePlaybackProgress(_ candidate: UUID, generation: UInt64) {
+        stateLock.lock()
+        if token == candidate, playbackGeneration == generation {
+            retryAttempt = 0
+        }
         stateLock.unlock()
     }
 
-    private func finishAttempt(_ candidate: UUID, generation: UInt64, retry: Bool) {
+    private func finishAttempt(
+        _ candidate: UUID,
+        generation: UInt64,
+        retry: Bool,
+        rebuildRenderer: Bool = false
+    ) {
         stateLock.lock()
         guard token == candidate, playbackGeneration == generation else {
             stateLock.unlock()
             return
         }
         token = nil
-        reader = nil
-        let shouldRetry = retry && playbackRequested
+        let shouldRetry = retry
+            && playbackRequested
+            && !stopped
+            && retryAttempt < 5
         let delay = min(0.25 * pow(2, Double(retryAttempt)), 4)
-        if shouldRetry { retryAttempt = min(retryAttempt + 1, 5) }
+        if shouldRetry { retryAttempt += 1 }
+        let shouldFallBack = retry && playbackRequested && !stopped && !shouldRetry
         stateLock.unlock()
 
-        guard shouldRetry else { return }
-        decodeQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            self.stateLock.lock()
-            guard self.playbackRequested,
-                  self.playbackGeneration == generation,
-                  self.token == nil
-            else {
+        if shouldRetry {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                guard self.isGenerationCurrent(generation) else { return }
+                if rebuildRenderer {
+                    self.rebuildDisplayLayerIfFailed()
+                }
+                self.stateLock.lock()
+                guard self.playbackRequested,
+                      !self.stopped,
+                      self.playbackGeneration == generation,
+                      self.token == nil
+                else {
+                    self.stateLock.unlock()
+                    return
+                }
+                let retryToken = UUID()
+                self.token = retryToken
                 self.stateLock.unlock()
-                return
+                self.startAttempt(retryToken, generation: generation)
             }
-            let retryToken = UUID()
-            self.token = retryToken
-            self.stateLock.unlock()
-            self.startAttempt(retryToken, generation: generation)
+        } else if shouldFallBack {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.isGenerationCurrent(generation) else { return }
+                if rebuildRenderer {
+                    self.rebuildDisplayLayerIfFailed()
+                }
+                self.showStill()
+            }
         }
+    }
+
+    /// A display renderer can remain failed after `flush()`. Replace only its
+    /// sublayer; the root layer and CAContext handed to WallpaperAgent stay
+    /// alive and keep the same point-space geometry.
+    private func rebuildDisplayLayerIfFailed() {
+        renderLock.lock()
+        guard renderer.status == .failed else {
+            renderLock.unlock()
+            return
+        }
+
+        let replacement = AVSampleBufferDisplayLayer()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        replacement.frame = rootLayer.bounds
+        replacement.contentsScale = rootLayer.contentsScale
+        replacement.videoGravity = .resizeAspectFill
+        replacement.isOpaque = true
+        replacement.controlTimebase = timebase
+        setDisallowsVideoLayerDisplayCompositing(replacement)
+
+        displayLayer.removeFromSuperlayer()
+        rootLayer.addSublayer(replacement)
+        CATransaction.commit()
+
+        displayLayer = replacement
+        renderer = replacement.sampleBufferRenderer
+        CMTimebaseSetTime(timebase, time: .zero)
+        CMTimebaseSetRate(timebase, rate: 0)
+        renderer.flush()
+        markDisplayImmediately(playbackPlaceholderBuffer)
+        renderer.enqueue(playbackPlaceholderBuffer)
+        renderLock.unlock()
     }
 
     private func decodeLoop(
@@ -670,41 +906,40 @@ private final class SampleBufferPump: @unchecked Sendable {
         token: UUID,
         generation: UInt64
     ) {
-        defer { finishAttempt(token, generation: generation, retry: true) }
+        var rendererNeedsRebuild = false
+        defer {
+            finishAttempt(
+                token,
+                generation: generation,
+                retry: true,
+                rebuildRenderer: rendererNeedsRebuild
+            )
+        }
         var loopOffset = CMTime.zero
-        while isCurrent(token) {
+        while isCurrent(token, generation: generation) {
             guard let reader = try? AVAssetReader(asset: asset) else { break }
             let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
             output.alwaysCopiesSampleData = false
             guard reader.canAdd(output) else { break }
             reader.add(output)
             guard reader.startReading() else { break }
-            stateLock.lock()
-            self.reader = reader
-            stateLock.unlock()
 
             var firstPTS: CMTime?
             var lastEnd = loopOffset
-            while isCurrent(token), reader.status == .reading {
-                // The system renderer can silently enter a failed state (for
-                // example across display power transitions); enqueue then
-                // becomes a no-op and the wallpaper freezes. A failed status
-                // aborts the attempt so the retry path restarts playback.
-                // requiresFlushToResumeDecoding also fires on benign decoder
-                // discontinuities (such as the loop boundary); recover with an
-                // in-place flush instead of aborting, otherwise the loop never
-                // restarts and the wallpaper stays frozen on the last frame.
-                if renderer.status == .failed || renderer.requiresFlushToResumeDecoding {
-                    renderLock.lock()
+            var rendererFailed = false
+            while isCurrent(token, generation: generation), reader.status == .reading {
+                renderLock.lock()
+                if renderer.requiresFlushToResumeDecoding {
                     renderer.flush()
-                    renderLock.unlock()
-                    if renderer.status == .failed {
-                        reader.cancelReading()
-                        return
-                    }
-                    continue
                 }
-                guard renderer.isReadyForMoreMediaData else {
+                rendererFailed = renderer.status == .failed
+                let ready = renderer.isReadyForMoreMediaData
+                renderLock.unlock()
+                if rendererFailed {
+                    rendererNeedsRebuild = true
+                    break
+                }
+                guard ready else {
                     Thread.sleep(forTimeInterval: 0.004)
                     continue
                 }
@@ -712,54 +947,45 @@ private final class SampleBufferPump: @unchecked Sendable {
                     Thread.sleep(forTimeInterval: 0.002)
                     continue
                 }
-                notePlaybackProgress(token)
+                notePlaybackProgress(token, generation: generation)
                 let samplePTS = CMSampleBufferGetPresentationTimeStamp(sample)
                 if firstPTS == nil, samplePTS.isNumeric {
-                    // Base the loop shift on the earliest timestamp of the
-                    // pass. The first decode timestamp is usually earlier than
-                    // the presentation timestamp; shifting by PTS alone sends
-                    // the decode timeline backwards at the loop boundary,
-                    // which trips the decoder's discontinuity handling.
                     let sampleDTS = CMSampleBufferGetDecodeTimeStamp(sample)
                     firstPTS = sampleDTS.isNumeric
                         ? CMTimeMinimum(samplePTS, sampleDTS)
                         : samplePTS
                 }
                 let shift = CMTimeSubtract(loopOffset, firstPTS ?? .zero)
-                let adjusted = retime(sample, by: shift) ?? sample
+                guard let adjusted = retime(sample, by: shift) else { continue }
                 let pts = CMSampleBufferGetPresentationTimeStamp(adjusted)
-                let duration = CMSampleBufferGetDuration(adjusted).isNumeric
-                    ? CMSampleBufferGetDuration(adjusted)
-                    : CMTime(value: 1, timescale: 30)
-                // A sample with a non-numeric timestamp (the trailing sample of
-                // a pass can carry one) must neither advance lastEnd nor reach
-                // the renderer: CMTimeMaximum propagates invalid times, and one
-                // poisoned loopOffset turns every following pass into a no-op,
-                // freezing the wallpaper on the last decoded frame.
+                let duration = CMSampleBufferGetDuration(adjusted)
                 guard pts.isNumeric else { continue }
-                let end = CMTimeAdd(pts, duration)
-                if end.isNumeric { lastEnd = CMTimeMaximum(lastEnd, end) }
+                if duration.isNumeric {
+                    lastEnd = CMTimeMaximum(lastEnd, CMTimeAdd(pts, duration))
+                }
 
                 renderLock.lock()
-                if isCurrent(token) { renderer.enqueue(adjusted) }
+                if isCurrent(token, generation: generation) {
+                    renderer.enqueue(adjusted)
+                }
                 renderLock.unlock()
             }
-            reader.cancelReading()
-            if !isCurrent(token) { break }
-            if lastEnd.isNumeric, CMTimeCompare(lastEnd, loopOffset) > 0 {
+            if reader.status == .reading {
+                reader.cancelReading()
+            }
+            guard !rendererFailed,
+                  isCurrent(token, generation: generation),
+                  reader.status != .failed
+            else { break }
+            if CMTimeCompare(lastEnd, loopOffset) > 0 {
                 loopOffset = lastEnd
-            } else if trackDuration.isNumeric, CMTimeCompare(trackDuration, .zero) > 0 {
+            } else if CMTimeCompare(trackDuration, .zero) > 0 {
                 loopOffset = CMTimeAdd(loopOffset, trackDuration)
             } else {
-                // No trustworthy way to advance the timeline; restart playback
-                // from scratch via the retry path instead of spinning.
                 break
             }
-            if reader.status == .failed || reader.status == .cancelled { break }
         }
     }
-
-    deinit { stop() }
 }
 
 private func retime(_ sample: CMSampleBuffer, by offset: CMTime) -> CMSampleBuffer? {
@@ -877,112 +1103,34 @@ private func setDisallowsVideoLayerDisplayCompositing(_ layer: CALayer) {
     unsafeBitCast(implementation, to: Setter.self)(layer, selector, true)
 }
 
-private struct SharedWallpaperItem: Codable {
-    let id: UUID
-    let fileName: String
-    let title: String
-    let createdAt: Date
-    let desktopImageFileNames: [String: String]?
-}
-
-private struct SharedPlaybackState: Codable {
-    let enabled: Bool
-    let updatedAt: Date
-}
-
-private struct SharedRendererReadyState: Codable {
-    let itemID: UUID
-    let updatedAt: Date
-    let runtimeBuild: String
-}
-
-private struct SharedSettingsReadyState: Codable {
-    let itemID: UUID
-    let updatedAt: Date
-    let runtimeBuild: String
-}
-
+/// The app's library, seen from inside the extension's sandbox container.
 private enum SharedWallpaperLibrary {
-    private static var runtimeBuild: String {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
-        return "\(version):\(LCLoadedCodeBuildIdentifier())"
+    /// Inside the sandbox this is the container's Documents folder, which is
+    /// where the app writes the library.
+    ///
+    /// Resolve it through `FileManager`, never by appending to
+    /// `NSHomeDirectory()`: the container is provisioned as the extension
+    /// launches, and the two do not agree on the first launch after install.
+    private static let reader = LivecoreLibraryReader(
+        root: FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(LivecoreLibraryFile.directoryName, isDirectory: true)
+    )
+
+    static func current() -> LivecoreWallpaperItem? { reader.currentItem() }
+
+    static func item(_ id: UUID) -> LivecoreWallpaperItem? { reader.item(id) }
+
+    static func videoURL(_ item: LivecoreWallpaperItem) -> URL { reader.videoURL(for: item) }
+
+    static func thumbnailURL(_ item: LivecoreWallpaperItem) -> URL { reader.thumbnailURL(for: item) }
+
+    static func thumbnail(_ item: LivecoreWallpaperItem) -> CGImage? {
+        image(reader.thumbnailURL(for: item))
     }
 
-    static var root: URL? {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("WallpaperLibrary", isDirectory: true)
-    }
-
-    static func current() -> SharedWallpaperItem? {
-        guard let root, let data = try? Data(contentsOf: root.appendingPathComponent("current.json"))
-        else { return nil }
-        return try? JSONDecoder().decode(SharedWallpaperItem.self, from: data)
-    }
-
-    static func item(_ id: UUID) -> SharedWallpaperItem? {
-        guard let root else { return nil }
-        if let data = try? Data(contentsOf: root.appendingPathComponent("\(id.uuidString).json")),
-           let item = try? JSONDecoder().decode(SharedWallpaperItem.self, from: data) {
-            return item
-        }
-        let current = current()
-        return current?.id == id ? current : nil
-    }
-
-    static func playbackEnabled() -> Bool {
-        guard let root,
-              let data = try? Data(contentsOf: root.appendingPathComponent("playback-state.json")),
-              let state = try? JSONDecoder().decode(SharedPlaybackState.self, from: data)
-        else { return false }
-        return state.enabled
-    }
-
-    static func videoURL(_ item: SharedWallpaperItem) -> URL? {
-        guard let root else { return nil }
-        let url = root.appendingPathComponent(item.fileName)
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
-    }
-
-    static func thumbnailURL(_ item: SharedWallpaperItem) -> URL? {
-        guard let root else { return nil }
-        let url = root.appendingPathComponent("\(item.id.uuidString).jpg")
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
-    }
-
-    static func thumbnail(_ item: SharedWallpaperItem) -> CGImage? {
-        thumbnailURL(item).flatMap(image)
-    }
-
-    static func desktopImage(_ item: SharedWallpaperItem, displayID: UInt32) -> CGImage? {
-        guard let root, let files = item.desktopImageFileNames else { return nil }
-        let name = files[String(displayID)] ?? files["default"]
-        return name.flatMap { image(root.appendingPathComponent($0)) }
-    }
-
-    static func markRendererReady(_ id: UUID) {
-        guard let root else { return }
-        let state = SharedRendererReadyState(
-            itemID: id,
-            updatedAt: Date(),
-            runtimeBuild: runtimeBuild
-        )
-        try? JSONEncoder().encode(state).write(
-            to: root.appendingPathComponent("renderer-ready.json"),
-            options: .atomic
-        )
-    }
-
-    static func markSettingsReady(_ id: UUID) {
-        guard let root else { return }
-        let state = SharedSettingsReadyState(
-            itemID: id,
-            updatedAt: Date(),
-            runtimeBuild: runtimeBuild
-        )
-        try? JSONEncoder().encode(state).write(
-            to: root.appendingPathComponent("settings-ready.json"),
-            options: .atomic
-        )
+    static func desktopStill(_ item: LivecoreWallpaperItem, displayID: UInt32) -> CGImage? {
+        reader.desktopImageURL(for: item, displayID: String(displayID)).flatMap(image)
     }
 
     private static func image(_ url: URL) -> CGImage? {
@@ -992,20 +1140,23 @@ private enum SharedWallpaperLibrary {
 
 private enum SettingsModelBridge {
     static func make() -> AnyObject? {
-        guard let item = SharedWallpaperLibrary.current(),
-              let videoURL = SharedWallpaperLibrary.videoURL(item),
-              let thumbnailURL = SharedWallpaperLibrary.thumbnailURL(item)
-        else { return remap(SettingsViewModels(desktop: emptyModel, screenSaver: nil)) }
+        // Without an identifier there is no provider to describe.
+        guard let bundleID = Bundle.main.bundleIdentifier else { return nil }
+        // An empty model is the honest answer when the app has published
+        // nothing: the Wallpaper pane then shows no Livecore entry.
+        guard let item = SharedWallpaperLibrary.current() else {
+            return remap(SettingsViewModels(desktop: emptyModel, screenSaver: nil))
+        }
 
-        let provider = ChoiceProviderID(rawValue: Bundle.main.bundleIdentifier ?? "")
+        let provider = ChoiceProviderID(rawValue: bundleID)
         let descriptor = ChoiceIDDescriptor(
             provider: provider,
             identifier: item.id.uuidString,
-            files: [videoURL],
+            files: [SharedWallpaperLibrary.videoURL(item)],
             configuration: Data(item.id.uuidString.utf8)
         )
         let choiceID = ChoiceID(id: item.id.uuidString, descriptor: descriptor)
-        let thumbnail = Thumbnail.image(url: thumbnailURL)
+        let thumbnail = Thumbnail.image(url: SharedWallpaperLibrary.thumbnailURL(item))
         let choice = ChoiceDescriptor(
             id: choiceID,
             provider: provider,
@@ -1057,10 +1208,14 @@ private enum SettingsModelBridge {
                 withRootObject: LivecoreSettingsViewModelsArchive(value: models),
                 requiringSecureCoding: false
             )
-        } catch { return nil }
+        } catch {
+            return nil
+        }
         guard let runtime = NSClassFromString("WallpaperSettingsViewModelsXPC"),
               let unarchiver = try? NSKeyedUnarchiver(forReadingFrom: archive)
-        else { return nil }
+        else {
+            return nil
+        }
         unarchiver.requiresSecureCoding = false
         unarchiver.decodingFailurePolicy = .setErrorAndReturn
         unarchiver.setClass(runtime, forClassName: "LivecoreSettingsViewModelsArchive")
@@ -1228,12 +1383,47 @@ private final class LivecoreSettingsViewModelsArchive: NSObject, NSSecureCoding 
     }
 }
 
-private func requestDestination(_ request: Any?) -> RequestDestination {
-    let size = requestValue(named: "size", in: request) as? CGSize
-        ?? CGSize(width: 2560, height: 1440)
-    let scale = requestValue(named: "scaleFactor", in: request) as? CGFloat ?? 2
-    let displayID = requestValue(named: "directDisplayID", in: request) as? UInt32 ?? 0
-    return RequestDestination(size: size, scale: scale, displayID: displayID)
+/// Reads the surface WallpaperAgent is asking about out of its private request
+/// types. Anything missing means the request is not one Livecore can serve.
+private func requestSurface(_ identifier: Any?, _ request: Any?) -> RequestSurface? {
+    guard let identifier = findUUID(in: identifier),
+          let size = requestValue(named: "size", in: request) as? CGSize,
+          let scale = requestValue(named: "scaleFactor", in: request).flatMap(numericCGFloat),
+          size.width > 0, size.height > 0, scale > 0
+    else { return nil }
+    let displayID = requestValue(named: "directDisplayID", in: request)
+        .flatMap(numericUInt32) ?? 0
+    let isPreview = requestValue(named: "isPreview", in: request)
+        .flatMap(booleanValue) ?? false
+    return RequestSurface(
+        identifier: identifier,
+        displayID: displayID,
+        size: size,
+        scale: scale,
+        isPreview: isPreview
+    )
+}
+
+private func numericCGFloat(_ value: Any) -> CGFloat? {
+    if let value = value as? CGFloat { return value }
+    if let value = value as? NSNumber { return CGFloat(value.doubleValue) }
+    return nil
+}
+
+private func numericUInt32(_ value: Any) -> UInt32? {
+    if let value = value as? UInt32 { return value }
+    if let value = value as? NSNumber {
+        let number = value.int64Value
+        guard number >= 0, number <= Int64(UInt32.max) else { return nil }
+        return UInt32(number)
+    }
+    return nil
+}
+
+private func booleanValue(_ value: Any) -> Bool? {
+    if let value = value as? Bool { return value }
+    if let value = value as? NSNumber { return value.boolValue }
+    return nil
 }
 
 private func requestString(named name: String, in value: Any?) -> String? {
@@ -1254,6 +1444,8 @@ private func requestValue(named name: String, in value: Any?, depth: Int = 0) ->
     return nil
 }
 
+/// Case name of one of WallpaperExtensionKit's private enums, which arrive as
+/// opaque values because their types cannot be imported.
 private func enumCaseName(_ value: Any) -> String {
     let mirror = Mirror(reflecting: value)
     if mirror.displayStyle == .enum, let label = mirror.children.first?.label { return label }
@@ -1261,20 +1453,18 @@ private func enumCaseName(_ value: Any) -> String {
     return description.split(separator: ".").last.map(String.init) ?? description
 }
 
-private func wallpaperIdentifier(_ value: Any?) -> String {
-    if let uuid = findUUID(in: value) { return uuid.uuidString }
-    return String(describing: value ?? "unknown")
-}
+private let uuidPattern = try! NSRegularExpression(
+    pattern: "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+)
 
+/// Digs a wallpaper identifier out of WallpaperExtensionKit's private types,
+/// which arrive as opaque values with no importable declaration.
 private func findUUID(in value: Any?, depth: Int = 0) -> UUID? {
     guard let value, depth < 8 else { return nil }
     if let uuid = value as? UUID { return uuid }
     if let string = value as? String, let uuid = UUID(uuidString: string) { return uuid }
     let description = String(describing: value)
-    let expression = try? NSRegularExpression(
-        pattern: "[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
-    )
-    if let match = expression?.firstMatch(
+    if let match = uuidPattern.firstMatch(
         in: description,
         range: NSRange(description.startIndex..., in: description)
     ), let range = Range(match.range, in: description), let uuid = UUID(uuidString: String(description[range])) {

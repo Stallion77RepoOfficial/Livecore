@@ -17,6 +17,14 @@ enum VideoScaleType: String, CaseIterable {
         case .center: return "Center"
         }
     }
+
+    var videoGravity: AVLayerVideoGravity {
+        switch self {
+        case .fill: return .resizeAspectFill
+        case .stretch: return .resize
+        case .fit, .center: return .resizeAspect
+        }
+    }
 }
 
 final class AppSettings {
@@ -27,17 +35,15 @@ final class AppSettings {
         static let scaleType = "scaleType"
         static let desktopEnabled = "desktopEnabled"
         static let keepScreenAwakeOnLock = "keepScreenAwakeOnLock"
+        static let installationIdentity = "installationIdentity"
+        static let installationCleanupPending = "installationCleanupPending"
     }
 
     private let defaults = UserDefaults.standard
 
     var scaleType: VideoScaleType {
-        get {
-            VideoScaleType(rawValue: defaults.string(forKey: Key.scaleType) ?? "") ?? .fill
-        }
-        set {
-            defaults.set(newValue.rawValue, forKey: Key.scaleType)
-        }
+        get { VideoScaleType(rawValue: defaults.string(forKey: Key.scaleType) ?? "") ?? .fill }
+        set { defaults.set(newValue.rawValue, forKey: Key.scaleType) }
     }
 
     var desktopEnabled: Bool {
@@ -63,7 +69,6 @@ final class AppSettings {
         guard let bookmark = defaults.data(forKey: Key.videoBookmark) else {
             return nil
         }
-
         var stale = false
         let url = try URL(
             resolvingBookmarkData: bookmark,
@@ -71,33 +76,74 @@ final class AppSettings {
             relativeTo: nil,
             bookmarkDataIsStale: &stale
         )
-
         if stale {
             try saveVideoURL(url)
         }
         return url
     }
 
-    func clearVideo() {
-        defaults.removeObject(forKey: Key.videoBookmark)
+    /// App deletion does not remove UserDefaults. Tie wallpaper ownership to
+    /// the concrete executable instance so replacing/reinstalling the bundle
+    /// cannot silently restart a video selected by an earlier installation.
+    func prepareForCurrentInstallation() -> Bool {
+        let identity = currentInstallationIdentity()
+        if defaults.string(forKey: Key.installationIdentity) != identity {
+            defaults.set(identity, forKey: Key.installationIdentity)
+            defaults.set(false, forKey: Key.desktopEnabled)
+            defaults.set(false, forKey: Key.keepScreenAwakeOnLock)
+            defaults.removeObject(forKey: Key.videoBookmark)
+            defaults.set(true, forKey: Key.installationCleanupPending)
+        }
+        return defaults.bool(forKey: Key.installationCleanupPending)
+    }
+
+    func completeInstallationCleanup() {
+        defaults.set(false, forKey: Key.installationCleanupPending)
+    }
+
+    private func currentInstallationIdentity() -> String {
+        guard let executable = Bundle.main.executableURL,
+              let attributes = try? FileManager.default.attributesOfItem(atPath: executable.path)
+        else {
+            return Bundle.main.bundleURL.standardizedFileURL.path
+        }
+        let device = (attributes[.systemNumber] as? NSNumber)?.uint64Value ?? 0
+        let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        let created = (attributes[.creationDate] as? Date)?.timeIntervalSince1970.bitPattern ?? 0
+        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970.bitPattern ?? 0
+        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
+        return "\(device):\(inode):\(created):\(modified):\(size)"
     }
 }
 
-@available(macOS 13.0, *)
 final class LoginItemManager {
     static let shared = LoginItemManager()
+    private static let legacyDefaultsDomains = ["com.berkegulacar.Livecore"]
 
-    var isEnabled: Bool {
-        SMAppService.mainApp.status == .enabled
-    }
+    var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
 
     func setEnabled(_ enabled: Bool) throws {
-        if enabled {
-            if SMAppService.mainApp.status != .enabled {
-                try SMAppService.mainApp.register()
+        if enabled, !isEnabled {
+            try SMAppService.mainApp.register()
+        } else if !enabled {
+            switch SMAppService.mainApp.status {
+            case .enabled, .requiresApproval:
+                try SMAppService.mainApp.unregister()
+            case .notRegistered, .notFound:
+                break
+            @unknown default:
+                try SMAppService.mainApp.unregister()
             }
-        } else if SMAppService.mainApp.status == .enabled {
-            try SMAppService.mainApp.unregister()
+        }
+    }
+
+    /// A replacement app is a fresh installation. The public API can remove
+    /// this main app's registration; legacy bundle IDs have no targeted
+    /// unregister API, but their persisted app preferences can still be purged.
+    func resetForNewInstallation() {
+        try? setEnabled(false)
+        for identifier in Self.legacyDefaultsDomains {
+            UserDefaults.standard.removePersistentDomain(forName: identifier)
         }
     }
 }
@@ -107,14 +153,16 @@ final class WallpaperWindow: NSWindow {
     override var canBecomeMain: Bool { false }
 }
 
+/// One borderless window pinned just above the Desktop picture, looping a video
+/// on a single screen.
 final class WallpaperSurface {
-    let window: WallpaperWindow
-    let player: AVPlayer
-    let playerLayer: AVPlayerLayer
-    let playerItem: AVPlayerItem
-    let screen: NSScreen
-
+    private let window: WallpaperWindow
+    private let player: AVPlayer
+    private let playerLayer: AVPlayerLayer
+    private let playerItem: AVPlayerItem
+    private let screen: NSScreen
     private let scaleType: VideoScaleType
+
     private var endObserver: NSObjectProtocol?
     private var presentationObserver: NSKeyValueObservation?
 
@@ -122,11 +170,9 @@ final class WallpaperSurface {
         self.screen = screen
         self.scaleType = scaleType
 
-        let item = AVPlayerItem(url: videoURL)
-        playerItem = item
-        player = AVPlayer(playerItem: item)
+        playerItem = AVPlayerItem(url: videoURL)
+        player = AVPlayer(playerItem: playerItem)
         playerLayer = AVPlayerLayer(player: player)
-
         window = WallpaperWindow(
             contentRect: screen.frame,
             styleMask: [.borderless],
@@ -137,7 +183,6 @@ final class WallpaperSurface {
 
         configureWindow()
         configurePlayer()
-        configureLayer()
         installObservers()
         layout()
     }
@@ -152,14 +197,8 @@ final class WallpaperSurface {
     }
 
     private func configureWindow() {
-        let desktopLevel = Int(CGWindowLevelForKey(.desktopWindow))
-        window.level = NSWindow.Level(rawValue: desktopLevel + 1)
-        window.collectionBehavior = [
-            .canJoinAllSpaces,
-            .stationary,
-            .ignoresCycle,
-            .fullScreenAuxiliary,
-        ]
+        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false
@@ -171,6 +210,10 @@ final class WallpaperSurface {
         contentView.layer = CALayer()
         contentView.layer?.backgroundColor = NSColor.clear.cgColor
         window.contentView = contentView
+
+        playerLayer.backgroundColor = NSColor.clear.cgColor
+        playerLayer.needsDisplayOnBoundsChange = true
+        contentView.layer?.addSublayer(playerLayer)
     }
 
     private func configurePlayer() {
@@ -178,15 +221,6 @@ final class WallpaperSurface {
         player.actionAtItemEnd = .none
         player.automaticallyWaitsToMinimizeStalling = false
         player.preventsDisplaySleepDuringVideoPlayback = false
-    }
-
-    private func configureLayer() {
-        guard let rootLayer = window.contentView?.layer else {
-            return
-        }
-        playerLayer.backgroundColor = NSColor.clear.cgColor
-        playerLayer.needsDisplayOnBoundsChange = true
-        rootLayer.addSublayer(playerLayer)
     }
 
     private func installObservers() {
@@ -198,24 +232,15 @@ final class WallpaperSurface {
             guard let self else {
                 return
             }
-            self.player.seek(
-                to: .zero,
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            ) { finished in
+            self.player.seek(to: .zero, toleranceBefore: .zero, toleranceAfter: .zero) { finished in
                 if finished {
                     self.player.playImmediately(atRate: 1)
                 }
             }
         }
 
-        presentationObserver = playerItem.observe(
-            \.presentationSize,
-            options: [.initial, .new]
-        ) { [weak self] _, _ in
-            DispatchQueue.main.async {
-                self?.layout()
-            }
+        presentationObserver = playerItem.observe(\.presentationSize, options: [.initial, .new]) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.layout() }
         }
     }
 
@@ -225,13 +250,9 @@ final class WallpaperSurface {
         player.playImmediately(atRate: 1)
     }
 
-    func pause() {
-        player.pause()
-    }
+    func pause() { player.pause() }
 
-    func resume() {
-        player.playImmediately(atRate: 1)
-    }
+    func resume() { player.playImmediately(atRate: 1) }
 
     func close() {
         player.pause()
@@ -240,103 +261,63 @@ final class WallpaperSurface {
     }
 
     func layout() {
-        guard let contentView = window.contentView else {
+        guard let bounds = window.contentView?.bounds else {
             return
         }
-        let bounds = contentView.bounds
-
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-
-        switch scaleType {
-        case .fill:
-            playerLayer.videoGravity = .resizeAspectFill
+        playerLayer.videoGravity = scaleType.videoGravity
+        let videoSize = playerItem.presentationSize
+        if scaleType == .center, videoSize.width > 0, videoSize.height > 0 {
+            playerLayer.frame = NSRect(
+                x: (bounds.width - videoSize.width) / 2,
+                y: (bounds.height - videoSize.height) / 2,
+                width: videoSize.width,
+                height: videoSize.height
+            ).integral
+        } else {
             playerLayer.frame = bounds
-        case .fit:
-            playerLayer.videoGravity = .resizeAspect
-            playerLayer.frame = bounds
-        case .stretch:
-            playerLayer.videoGravity = .resize
-            playerLayer.frame = bounds
-        case .center:
-            playerLayer.videoGravity = .resizeAspect
-            let videoSize = playerItem.presentationSize
-            if videoSize.width > 0, videoSize.height > 0 {
-                playerLayer.frame = NSRect(
-                    x: (bounds.width - videoSize.width) / 2,
-                    y: (bounds.height - videoSize.height) / 2,
-                    width: videoSize.width,
-                    height: videoSize.height
-                ).integral
-            } else {
-                playerLayer.frame = bounds
-            }
         }
-
         CATransaction.commit()
     }
 }
 
 @MainActor
-final class WallpaperEngine: @unchecked Sendable {
+final class WallpaperEngine {
     static let shared = WallpaperEngine()
 
     private var surfaces: [WallpaperSurface] = []
     private var activeURL: URL?
     private var securityScopedURL: URL?
-    private var hasSecurityScope = false
     private var activeScaleType: VideoScaleType = .fill
-    private var observers: [NSObjectProtocol] = []
+    private var observers: [(center: NotificationCenter, token: NSObjectProtocol)] = []
 
     var isActive: Bool { !surfaces.isEmpty }
 
     private init() {
-        let center = NotificationCenter.default
-        let engine = self
-
-        observers.append(center.addObserver(
-            forName: NSApplication.didChangeScreenParametersNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            Task { @MainActor in engine.rebuildForCurrentScreens() }
-        })
-
-        observers.append(center.addObserver(
-            forName: NSWorkspace.screensDidSleepNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            Task { @MainActor in engine.pause() }
-        })
-
-        observers.append(center.addObserver(
-            forName: NSWorkspace.screensDidWakeNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            Task { @MainActor in engine.resume() }
-        })
-
-        observers.append(center.addObserver(
-            forName: NSWorkspace.sessionDidResignActiveNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            Task { @MainActor in engine.pause() }
-        })
-
-        observers.append(center.addObserver(
-            forName: NSWorkspace.sessionDidBecomeActiveNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            Task { @MainActor in engine.resume() }
-        })
+        // Screen and session notifications come from the workspace center, not
+        // the default one; observing them on `.default` never fires.
+        let workspace = NSWorkspace.shared.notificationCenter
+        observe(NSApplication.didChangeScreenParametersNotification, on: .default) { $0.rebuildForCurrentScreens() }
+        observe(NSWorkspace.screensDidSleepNotification, on: workspace) { $0.pause() }
+        observe(NSWorkspace.screensDidWakeNotification, on: workspace) { $0.resume() }
+        observe(NSWorkspace.sessionDidResignActiveNotification, on: workspace) { $0.pause() }
+        observe(NSWorkspace.sessionDidBecomeActiveNotification, on: workspace) { $0.resume() }
     }
 
     deinit {
-        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.forEach { $0.center.removeObserver($0.token) }
+    }
+
+    private func observe(
+        _ name: NSNotification.Name,
+        on center: NotificationCenter,
+        handler: @escaping @MainActor (WallpaperEngine) -> Void
+    ) {
+        let token = center.addObserver(forName: name, object: nil, queue: .main) { _ in
+            Task { @MainActor in handler(WallpaperEngine.shared) }
+        }
+        observers.append((center, token))
     }
 
     func start(videoURL: URL, scaleType: VideoScaleType) throws {
@@ -347,10 +328,8 @@ final class WallpaperEngine: @unchecked Sendable {
                 userInfo: [NSLocalizedDescriptionKey: "The selected video file could not be found."]
             )
         }
-
         stop()
-        hasSecurityScope = videoURL.startAccessingSecurityScopedResource()
-        securityScopedURL = videoURL
+        securityScopedURL = videoURL.startAccessingSecurityScopedResource() ? videoURL : nil
         activeURL = videoURL
         activeScaleType = scaleType
         rebuildForCurrentScreens()
@@ -360,17 +339,20 @@ final class WallpaperEngine: @unchecked Sendable {
         surfaces.forEach { $0.close() }
         surfaces.removeAll()
         activeURL = nil
-
-        if let securityScopedURL, hasSecurityScope {
-            securityScopedURL.stopAccessingSecurityScopedResource()
-        }
+        securityScopedURL?.stopAccessingSecurityScopedResource()
         securityScopedURL = nil
-        hasSecurityScope = false
     }
 
-    func pause() {
-        surfaces.forEach { $0.pause() }
+    /// Re-lays out a running Desktop playback for a new scale. Does nothing
+    /// when the Desktop is not active, so the setting simply takes effect the
+    /// next time playback starts.
+    func setScale(_ scale: VideoScaleType) {
+        guard activeScaleType != scale else { return }
+        activeScaleType = scale
+        rebuildForCurrentScreens()
     }
+
+    func pause() { surfaces.forEach { $0.pause() } }
 
     func resume() {
         guard activeURL != nil else {
@@ -383,7 +365,6 @@ final class WallpaperEngine: @unchecked Sendable {
         guard let activeURL else {
             return
         }
-
         surfaces.forEach { $0.close() }
         surfaces = NSScreen.screens.map {
             WallpaperSurface(screen: $0, videoURL: activeURL, scaleType: activeScaleType)
@@ -392,64 +373,69 @@ final class WallpaperEngine: @unchecked Sendable {
     }
 }
 
-final class PowerAssertionManager: @unchecked Sendable {
+@MainActor
+final class PowerAssertionManager {
     static let shared = PowerAssertionManager()
+
     private var assertionID: IOPMAssertionID = 0
     private var isAsserting = false
 
     func updateAssertionState() {
-        let shouldKeepAwake = AppSettings.shared.keepScreenAwakeOnLock
-        if shouldKeepAwake {
-            createAssertion()
+        if AppSettings.shared.keepScreenAwakeOnLock {
+            guard !isAsserting else { return }
+            let result = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Livecore Keep Screen Awake on Lock" as CFString,
+                &assertionID
+            )
+            isAsserting = result == kIOReturnSuccess
         } else {
-            releaseAssertion()
+            guard isAsserting else { return }
+            IOPMAssertionRelease(assertionID)
+            assertionID = 0
+            isAsserting = false
         }
-    }
-
-    private func createAssertion() {
-        guard !isAsserting else { return }
-        let reason = "Livecore Keep Screen Awake on Lock" as CFString
-        let result = IOPMAssertionCreateWithName(
-            kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
-            IOPMAssertionLevel(kIOPMAssertionLevelOn),
-            reason,
-            &assertionID
-        )
-        if result == kIOReturnSuccess {
-            isAsserting = true
-        }
-    }
-
-    private func releaseAssertion() {
-        guard isAsserting else { return }
-        IOPMAssertionRelease(assertionID)
-        assertionID = 0
-        isAsserting = false
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private var settingsWindowController: DashboardWindowController?
+    private var dashboard: DashboardWindowController?
     private var statusItem: NSStatusItem?
     private var keepAwakeMenuItem: NSMenuItem?
+    private var scaleMenuItems: [NSMenuItem] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let needsInstallationCleanup = AppSettings.shared.prepareForCurrentInstallation()
+        if needsInstallationCleanup {
+            LoginItemManager.shared.resetForNewInstallation()
+        }
         NSApp.setActivationPolicy(.accessory)
         PowerAssertionManager.shared.updateAssertionState()
         installStatusMenu()
 
-        let settings = AppSettings.shared
-        do {
-            let videoURL = try settings.resolveVideoURL()
+        if needsInstallationCleanup {
+            Task {
+                do {
+                    try await WallpaperStoreManager.shared.resetForNewInstallation()
+                    AppSettings.shared.completeInstallationCleanup()
+                } catch {
+                    NSApp.presentError(error)
+                }
+                showSettings()
+            }
+            return
+        }
 
-            if settings.desktopEnabled, let videoURL {
+        do {
+            let videoURL = try AppSettings.shared.resolveVideoURL()
+            if AppSettings.shared.desktopEnabled, let videoURL {
                 try WallpaperEngine.shared.start(
                     videoURL: videoURL,
-                    scaleType: settings.scaleType
+                    scaleType: AppSettings.shared.scaleType
                 )
             }
-
             if videoURL == nil {
                 showSettings()
             }
@@ -457,13 +443,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             showSettings()
             NSApp.presentError(error)
         }
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        // The Lock Screen extension is owned by macOS and survives the host app.
-        // Preserve the user's Desktop preference across logout, crashes, and
-        // Xcode relaunches; an explicit Stop/Quit action clears it instead.
-        WallpaperEngine.shared.stop()
     }
 
     private func installStatusMenu() {
@@ -481,23 +460,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let scaleMenu = NSMenu()
         for (index, scale) in VideoScaleType.allCases.enumerated() {
-            let scaleItem = NSMenuItem(
-                title: scale.title,
-                action: #selector(changeScale(_:)),
-                keyEquivalent: ""
-            )
+            let scaleItem = NSMenuItem(title: scale.title, action: #selector(changeScale(_:)), keyEquivalent: "")
             scaleItem.tag = index
             scaleItem.state = scale == AppSettings.shared.scaleType ? .on : .off
-            scaleItem.target = self
             scaleMenu.addItem(scaleItem)
         }
+        scaleMenuItems = scaleMenu.items
         let scaleRoot = NSMenuItem(title: "Type & Scale", action: nil, keyEquivalent: "")
         scaleRoot.submenu = scaleMenu
         menu.addItem(scaleRoot)
 
         let awakeItem = NSMenuItem(
             title: "Keep Screen Awake on Lock",
-            action: #selector(toggleKeepScreenAwake(_:)),
+            action: #selector(toggleKeepScreenAwake),
             keyEquivalent: ""
         )
         awakeItem.state = AppSettings.shared.keepScreenAwakeOnLock ? .on : .off
@@ -507,32 +482,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit Livecore", action: #selector(quit), keyEquivalent: "q"))
         menu.items.forEach { $0.target = self }
+        scaleMenu.items.forEach { $0.target = self }
 
         item.menu = menu
         statusItem = item
     }
 
+    /// The dashboard writes the same settings, so the menu re-reads them every
+    /// time it opens instead of trying to stay in sync from the other side.
     func menuWillOpen(_ menu: NSMenu) {
         updateKeepAwakeMenuItemState()
+        for item in scaleMenuItems {
+            item.state = VideoScaleType.allCases[item.tag] == AppSettings.shared.scaleType ? .on : .off
+        }
     }
 
     func updateKeepAwakeMenuItemState() {
         keepAwakeMenuItem?.state = AppSettings.shared.keepScreenAwakeOnLock ? .on : .off
     }
 
-    @objc private func toggleKeepScreenAwake(_ sender: NSMenuItem) {
+    @objc private func toggleKeepScreenAwake() {
         AppSettings.shared.keepScreenAwakeOnLock.toggle()
         PowerAssertionManager.shared.updateAssertionState()
         updateKeepAwakeMenuItemState()
-        settingsWindowController?.updateKeepAwakeSwitchState()
+        dashboard?.updateKeepAwakeSwitchState()
     }
 
     @objc private func showSettings() {
-        if settingsWindowController == nil {
-            settingsWindowController = DashboardWindowController()
+        if dashboard == nil {
+            dashboard = DashboardWindowController()
         }
-        settingsWindowController?.showWindow(nil)
-        settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+        dashboard?.showWindow(nil)
+        dashboard?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -542,10 +523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 showSettings()
                 return
             }
-            try WallpaperEngine.shared.start(
-                videoURL: url,
-                scaleType: AppSettings.shared.scaleType
-            )
+            try WallpaperEngine.shared.start(videoURL: url, scaleType: AppSettings.shared.scaleType)
             AppSettings.shared.desktopEnabled = true
         } catch {
             NSApp.presentError(error)
@@ -561,16 +539,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard VideoScaleType.allCases.indices.contains(sender.tag) else {
             return
         }
-        AppSettings.shared.scaleType = VideoScaleType.allCases[sender.tag]
-        if AppSettings.shared.desktopEnabled {
-            playSavedVideo()
-        }
+        let scale = VideoScaleType.allCases[sender.tag]
+        AppSettings.shared.scaleType = scale
+        WallpaperEngine.shared.setScale(scale)
+        dashboard?.updateScaleControlState()
         sender.menu?.items.forEach { $0.state = $0 === sender ? .on : .off }
     }
 
     @objc private func quit() {
-        WallpaperEngine.shared.stop()
-        AppSettings.shared.desktopEnabled = false
         NSApp.terminate(nil)
     }
 }

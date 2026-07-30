@@ -9,45 +9,12 @@ struct LivecoreWallpaperItem: Codable, Equatable {
     let id: UUID
     let fileName: String
     let title: String
-    /// Kept on the wire for compatibility with extension processes from older
-    /// Livecore builds, which require this field when decoding an item.
-    let createdAt: Date
     /// Still shown per display while the screen is unlocked, keyed by display
     /// ID. macOS has no separate Lock Screen slot — the Lock Screen shows the
     /// Desktop picture — so Livecore owns the Desktop wallpaper and paints the
     /// user's previous Desktop picture whenever it is not playing. A `default`
     /// entry covers displays connected after the item was prepared.
     let desktopImageFileNames: [String: String]
-
-    init(
-        id: UUID,
-        fileName: String,
-        title: String,
-        createdAt: Date = Date(),
-        desktopImageFileNames: [String: String]
-    ) {
-        self.id = id
-        self.fileName = fileName
-        self.title = title
-        self.createdAt = createdAt
-        self.desktopImageFileNames = desktopImageFileNames
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case id, fileName, title, createdAt, desktopImageFileNames
-    }
-
-    init(from decoder: Decoder) throws {
-        let values = try decoder.container(keyedBy: CodingKeys.self)
-        id = try values.decode(UUID.self, forKey: .id)
-        fileName = try values.decode(String.self, forKey: .fileName)
-        title = try values.decode(String.self, forKey: .title)
-        createdAt = try values.decodeIfPresent(Date.self, forKey: .createdAt) ?? .distantPast
-        desktopImageFileNames = try values.decode(
-            [String: String].self,
-            forKey: .desktopImageFileNames
-        )
-    }
 }
 
 /// Names of the files that make up a library directory.

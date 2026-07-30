@@ -82,16 +82,18 @@ final class AppSettings {
         return url
     }
 
-    /// App deletion does not remove UserDefaults. Tie wallpaper ownership to
-    /// the concrete executable instance so replacing/reinstalling the bundle
-    /// cannot silently restart a video selected by an earlier installation.
+    /// App deletion does not remove UserDefaults, so a replaced bundle must not
+    /// silently resume a wallpaper the previous installation chose.
+    ///
+    /// The video bookmark is deliberately kept: it is the user's own grant, not
+    /// installation state. Clearing `desktopEnabled` is what actually stops the
+    /// silent resume, and wiping the selection on top of it made an ordinary
+    /// app update look like a factory reset.
     func prepareForCurrentInstallation() -> Bool {
         let identity = currentInstallationIdentity()
         if defaults.string(forKey: Key.installationIdentity) != identity {
             defaults.set(identity, forKey: Key.installationIdentity)
             defaults.set(false, forKey: Key.desktopEnabled)
-            defaults.set(false, forKey: Key.keepScreenAwakeOnLock)
-            defaults.removeObject(forKey: Key.videoBookmark)
             defaults.set(true, forKey: Key.installationCleanupPending)
         }
         return defaults.bool(forKey: Key.installationCleanupPending)
@@ -101,18 +103,21 @@ final class AppSettings {
         defaults.set(false, forKey: Key.installationCleanupPending)
     }
 
+    /// Where the bundle lives plus which build it is.
+    ///
+    /// Both survive a restart. The executable's `st_dev` and `st_ino` do not:
+    /// APFS assigns a volume's device number at mount time, so it can differ
+    /// between boots, and every restart then looked like a fresh installation
+    /// and reset the user's setup. App Translocation moves the executable to a
+    /// per-launch path for the same reason, which the bundle URL also avoids.
     private func currentInstallationIdentity() -> String {
-        guard let executable = Bundle.main.executableURL,
-              let attributes = try? FileManager.default.attributesOfItem(atPath: executable.path)
-        else {
-            return Bundle.main.bundleURL.standardizedFileURL.path
-        }
-        let device = (attributes[.systemNumber] as? NSNumber)?.uint64Value ?? 0
-        let inode = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
-        let created = (attributes[.creationDate] as? Date)?.timeIntervalSince1970.bitPattern ?? 0
-        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970.bitPattern ?? 0
-        let size = (attributes[.size] as? NSNumber)?.uint64Value ?? 0
-        return "\(device):\(inode):\(created):\(modified):\(size)"
+        let bundle = Bundle.main
+        let path = bundle.bundleURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let shortVersion = bundle.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "0"
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "0"
+        return "\(path)#\(shortVersion)(\(build))"
     }
 }
 
@@ -296,7 +301,17 @@ final class DesktopBackdropManager {
     private let workspace = NSWorkspace.shared
     private let defaults = UserDefaults.standard
     private var snapshots: [UInt32: Snapshot] = [:]
-    private var posterURL: URL?
+
+    /// Derived from a fixed location rather than remembered in a property, so a
+    /// later launch can still recognise — and clear — a poster an interrupted
+    /// session left sitting on the Desktop.
+    private let posterURL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Livecore/desktop-backdrop.jpg")
+
+    private var posterIsReady: Bool {
+        FileManager.default.fileExists(atPath: posterURL.path)
+    }
 
     private init() {
         if let data = defaults.data(forKey: Self.snapshotsKey),
@@ -306,26 +321,29 @@ final class DesktopBackdropManager {
     }
 
     func activate(videoURL: URL, scaleType: VideoScaleType) async throws {
-        if posterURL == nil {
-            posterURL = try await makePoster(from: videoURL)
-        }
+        // Always regenerate: the poster now lives at a fixed path, so a stale
+        // one from a previously chosen video would otherwise be reused.
+        try await makePoster(from: videoURL)
         try apply(scaleType: scaleType)
     }
 
     func apply(scaleType: VideoScaleType) throws {
-        guard let posterURL else { return }
+        guard posterIsReady else { return }
         var capturedNewSnapshot = false
 
         for screen in NSScreen.screens {
             let currentURL = workspace.desktopImageURL(for: screen)
-            // A Livecore extension URL means macOS currently owns the Lock
+            // A live Livecore extension URL means macOS currently owns the Lock
             // Screen selection. Writing through NSWorkspace here would replace
             // that private selection and make the Lock Screen silently fall
             // back later.
             guard !Self.isExtensionWallpaper(currentURL) else { continue }
             let displayID = Self.displayID(for: screen)
+            // Never snapshot a library path: it is Livecore's own asset, and a
+            // dead one restores to nothing.
             if snapshots[displayID] == nil,
-               let imageURL = currentURL {
+               let imageURL = currentURL,
+               !Self.isLibraryPath(imageURL) {
                 let options = workspace.desktopImageOptions(for: screen) ?? [:]
                 let archive = try NSKeyedArchiver.archivedData(
                     withRootObject: options,
@@ -365,31 +383,40 @@ final class DesktopBackdropManager {
     }
 
     func restore() {
-        guard !snapshots.isEmpty else {
-            removePoster()
-            return
-        }
-
         var failed = false
         var deferred = false
+
         for screen in NSScreen.screens {
-            if Self.isExtensionWallpaper(workspace.desktopImageURL(for: screen)) {
+            let currentURL = workspace.desktopImageURL(for: screen)
+            if Self.isExtensionWallpaper(currentURL) {
                 // Keep the restore point until the Lock Screen selection is
                 // removed. Restoring now would remove that selection.
                 deferred = true
                 continue
             }
             let displayID = Self.displayID(for: screen)
-            guard let snapshot = snapshots[displayID] else { continue }
-            let options = (try? NSKeyedUnarchiver.unarchivedObject(
-                ofClasses: [NSDictionary.self, NSString.self, NSNumber.self, NSColor.self],
-                from: snapshot.optionsArchive
-            )) as? [NSWorkspace.DesktopImageOptionKey: Any] ?? [:]
+            let target: (url: URL, options: [NSWorkspace.DesktopImageOptionKey: Any])?
+            if let snapshot = snapshots[displayID] {
+                let options = (try? NSKeyedUnarchiver.unarchivedObject(
+                    ofClasses: [NSDictionary.self, NSString.self, NSNumber.self, NSColor.self],
+                    from: snapshot.optionsArchive
+                )) as? [NSWorkspace.DesktopImageOptionKey: Any] ?? [:]
+                target = (snapshot.imageURL, options)
+            } else if isStrandedLivecoreWallpaper(currentURL) {
+                // Something of Livecore's is on the Desktop with no restore
+                // point behind it: an earlier session was interrupted before it
+                // recorded one, or a failed apply left a dead extension asset
+                // selected. Either way nothing else would ever take it down.
+                target = Self.systemDefaultPicture.map { ($0, [:]) }
+            } else {
+                target = nil
+            }
+            guard let target else { continue }
             do {
                 try workspace.setDesktopImageURL(
-                    snapshot.imageURL,
+                    target.url,
                     for: screen,
-                    options: options
+                    options: target.options
                 )
             } catch {
                 failed = true
@@ -402,12 +429,43 @@ final class DesktopBackdropManager {
         removePoster()
     }
 
+    /// Livecore's own poster, or a library asset a failed apply left selected
+    /// after deleting it. Both are pictures only Livecore could have put there
+    /// and neither can be displayed as the user's wallpaper.
+    private func isStrandedLivecoreWallpaper(_ url: URL?) -> Bool {
+        guard let url else { return false }
+        if url.standardizedFileURL == posterURL.standardizedFileURL { return true }
+        return Self.isLibraryPath(url) && !FileManager.default.fileExists(atPath: url.path)
+    }
+
+    /// Something macOS ships that is always safe to fall back to. The named
+    /// pictures move between releases, so an unrecoverable Desktop is avoided
+    /// by taking whatever the wallpaper folder actually holds.
+    private static let systemDefaultPicture: URL? = {
+        let fileManager = FileManager.default
+        let named = [
+            "/System/Library/CoreServices/DefaultDesktop.heic",
+            "/System/Library/CoreServices/DefaultBackground.jpg",
+        ].map(URL.init(fileURLWithPath:))
+        if let existing = named.first(where: { fileManager.fileExists(atPath: $0.path) }) {
+            return existing
+        }
+        let extensions: Set<String> = ["heic", "jpg", "jpeg", "png"]
+        return (try? fileManager.contentsOfDirectory(
+            at: URL(fileURLWithPath: "/System/Library/Desktop Pictures"),
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ))?
+            .filter { extensions.contains($0.pathExtension.lowercased()) }
+            .min { $0.lastPathComponent < $1.lastPathComponent }
+    }()
+
     private func persistSnapshots() throws {
         let data = try JSONEncoder().encode(Array(snapshots.values))
         defaults.set(data, forKey: Self.snapshotsKey)
     }
 
-    private func makePoster(from videoURL: URL) async throws -> URL {
+    private func makePoster(from videoURL: URL) async throws {
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: videoURL))
         generator.appliesPreferredTrackTransform = true
         let image = try await generator.image(
@@ -420,26 +478,15 @@ final class DesktopBackdropManager {
             throw CocoaError(.fileWriteUnknown)
         }
 
-        let directory = try FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        ).appendingPathComponent("Livecore", isDirectory: true)
         try FileManager.default.createDirectory(
-            at: directory,
+            at: posterURL.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        let url = directory.appendingPathComponent("desktop-backdrop.jpg")
-        try data.write(to: url, options: .atomic)
-        return url
+        try data.write(to: posterURL, options: .atomic)
     }
 
     private func removePoster() {
-        if let posterURL {
-            try? FileManager.default.removeItem(at: posterURL)
-        }
-        posterURL = nil
+        try? FileManager.default.removeItem(at: posterURL)
     }
 
     private static func displayID(for screen: NSScreen) -> UInt32 {
@@ -447,8 +494,18 @@ final class DesktopBackdropManager {
             .uint32Value ?? 0
     }
 
+    /// True only while the Lock Screen extension is really painting this
+    /// screen. A library path whose asset is gone is a dead selection left by a
+    /// failed apply: macOS is already showing its own fallback there, so the
+    /// Desktop poster must be written instead of deferred, otherwise the menu
+    /// bar and Dock keep tinting from that fallback.
     private static func isExtensionWallpaper(_ url: URL?) -> Bool {
-        url?.path.contains("/\(LivecoreLibraryFile.directoryName)/") == true
+        guard let url, isLibraryPath(url) else { return false }
+        return FileManager.default.fileExists(atPath: url.path)
+    }
+
+    private static func isLibraryPath(_ url: URL) -> Bool {
+        url.path.contains("/\(LivecoreLibraryFile.directoryName)/")
     }
 
     private static func options(
@@ -519,15 +576,18 @@ final class WallpaperEngine {
     }
 
     func start(videoURL: URL, scaleType: VideoScaleType) async throws {
+        stop()
+        // Take the security scope before looking: a bookmark-resolved URL is
+        // not readable until its scope is open.
+        securityScopedURL = videoURL.startAccessingSecurityScopedResource() ? videoURL : nil
         guard FileManager.default.fileExists(atPath: videoURL.path) else {
+            stop()
             throw NSError(
                 domain: "Livecore",
                 code: 1,
                 userInfo: [NSLocalizedDescriptionKey: "The selected video file could not be found."]
             )
         }
-        stop()
-        securityScopedURL = videoURL.startAccessingSecurityScopedResource() ? videoURL : nil
         activeURL = videoURL
         activeScaleType = scaleType
         do {
@@ -643,6 +703,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 showSettings()
             }
             return
+        }
+
+        // A session that was killed mid-playback leaves its poster as the
+        // Desktop picture. Nothing else would ever take it back down.
+        if !AppSettings.shared.desktopEnabled {
+            DesktopBackdropManager.shared.restore()
         }
 
         Task {

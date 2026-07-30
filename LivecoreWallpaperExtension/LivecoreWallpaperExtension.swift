@@ -509,8 +509,7 @@ private final class RenderSession {
     let isPreview: Bool
 
     var itemID: UUID { item.id }
-    var isHealthy: Bool { !invalidated && pump.isHealthy }
-    var isReady: Bool { isHealthy }
+    var isReady: Bool { !invalidated && pump.isHealthy }
 
     private var surface: RequestSurface
     private let item: LivecoreWallpaperItem

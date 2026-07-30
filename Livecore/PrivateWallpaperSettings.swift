@@ -21,14 +21,33 @@ enum PrivateWallpaperSettings {
         let settings: WallpaperUserSettings
     }
 
+    /// `WallpaperSettingsManager` initialises asynchronously and reports an
+    /// empty value until WallpaperAgent has answered. Treating that empty value
+    /// as the user's real wallpaper is what produced contentless restore points
+    /// and made a live Livecore selection look unselected, so every read goes
+    /// through here and a contentless snapshot is an error, never a fact.
+    private static func currentSettings() async throws -> WallpaperUserSettings {
+        let manager = WallpaperSettingsManager.shared
+        var lastError: Error?
+        for attempt in 0..<5 {
+            do {
+                try await manager.synchronize()
+                let settings = manager.desktopWallpaperUserSettings
+                if hasChoices(settings) { return settings }
+            } catch {
+                lastError = error
+            }
+            if attempt < 4 { try? await Task.sleep(for: .milliseconds(200)) }
+        }
+        throw lastError ?? LivecoreProviderError.wallpaperSettingsUnavailable
+    }
+
     /// Snapshot of the wallpaper Livecore is about to replace, used as the
     /// restore point.
     static func captureSettings() async throws -> Data {
-        let manager = WallpaperSettingsManager.shared
-        try await manager.synchronize()
-        return try JSONEncoder().encode(BackupEnvelope(
+        try JSONEncoder().encode(BackupEnvelope(
             version: 1,
-            settings: manager.desktopWallpaperUserSettings
+            settings: try await currentSettings()
         ))
     }
 
@@ -40,15 +59,19 @@ enum PrivateWallpaperSettings {
             files: [LivecoreWallpaperLibrary.shared.root.appendingPathComponent(item.fileName)],
             configuration: Data(item.id.uuidString.utf8)
         )
-        try await update(.allDisplays(WallpaperContentSettings(
-            choices: [.init(descriptor: descriptor)],
-            useAsDesktopWallpaperAndIdleWallpaper: false
-        )))
+        let choice = WallpaperChoice.ID(descriptor: descriptor)
+        try await update(
+            .allDisplays(WallpaperContentSettings(
+                choices: [choice],
+                useAsDesktopWallpaperAndIdleWallpaper: false
+            )),
+            accept: { selects([choice], in: $0) }
+        )
     }
 
     /// Restores the first semantically valid backup. Missing, corrupt,
-    /// pre-Codable, and known-dead Livecore provider backups fall through to
-    /// the next candidate, then to the macOS default.
+    /// contentless, pre-Codable, and known-dead Livecore provider backups fall
+    /// through to the next candidate, then to the macOS default.
     static func restore(
         from backups: [Data],
         rejectingProviderIDs: Set<String> = []
@@ -56,7 +79,16 @@ enum PrivateWallpaperSettings {
         let settings = backups.lazy.compactMap {
             restorableSettings(from: $0, rejectingProviderIDs: rejectingProviderIDs)
         }.first ?? systemDefaultSettings()
-        try await update(settings)
+
+        try await update(settings) { actual in
+            guard hasChoices(actual) else { return false }
+            if restored(settings, in: actual) { return true }
+            // macOS resolves the `default` provider to a concrete picture of
+            // its own, so an exact match is not always reachable. Once the
+            // rejected providers are gone the restore has done its job.
+            return !rejectingProviderIDs.isEmpty
+                && !containsProvider(in: actual, ids: rejectingProviderIDs)
+        }
     }
 
     static func firstRestorableBackup(
@@ -92,10 +124,10 @@ enum PrivateWallpaperSettings {
 
     /// The first selected choice owned by one of `providerIDs`. A nil item ID
     /// still represents a managed selection whose old configuration is corrupt.
+    /// Throws rather than reporting "nothing selected" when macOS will not hand
+    /// over a readable wallpaper.
     static func selection(providerIDs: Set<String>) async throws -> LivecoreWallpaperSelection? {
-        let manager = WallpaperSettingsManager.shared
-        try await manager.synchronize()
-        for content in contents(in: manager.desktopWallpaperUserSettings) {
+        for content in contents(in: try await currentSettings()) {
             for choice in content.choices {
                 let providerID = choice.descriptor.provider.rawValue
                 guard providerIDs.contains(providerID) else { continue }
@@ -114,22 +146,65 @@ enum PrivateWallpaperSettings {
         return selection?.providerID == providerID && selection?.itemID == itemID
     }
 
-    private static func update(_ settings: WallpaperUserSettings) async throws {
+    /// Writes `settings` and waits for macOS to report a state `accept` is
+    /// happy with. macOS normalises what it stores — an all-displays write can
+    /// come back per-display-space — so acceptance is semantic rather than an
+    /// equality check against what was written.
+    private static func update(
+        _ settings: WallpaperUserSettings,
+        accept: (WallpaperUserSettings) -> Bool
+    ) async throws {
         let manager = WallpaperSettingsManager.shared
         var lastError: Error?
         for _ in 0..<3 {
             do {
                 try await manager.updateDesktopWallpaperUserSettings(settings)
                 try await manager.synchronize()
-                if settingsEqual(manager.desktopWallpaperUserSettings, settings) {
-                    return
-                }
+                if accept(manager.desktopWallpaperUserSettings) { return }
             } catch {
                 lastError = error
             }
             try? await Task.sleep(for: .milliseconds(250))
         }
         throw lastError ?? LivecoreProviderError.lockScreenSelectionRejected
+    }
+
+    /// True when every display scope selects all of `expected`. Used for an
+    /// apply, which deliberately puts the same choice on every display.
+    private static func selects(
+        _ expected: [WallpaperChoice.ID],
+        in settings: WallpaperUserSettings
+    ) -> Bool {
+        let scopes = contents(in: settings)
+        guard !scopes.isEmpty, !expected.isEmpty else { return false }
+        return scopes.allSatisfy { scope in
+            expected.allSatisfy(scope.choices.contains)
+        }
+    }
+
+    /// True when `actual` is the wallpaper `requested` describes. A restore can
+    /// carry a different picture per display, so scopes are matched by key
+    /// rather than flattened; macOS may also normalise between the two shapes,
+    /// which the last branch tolerates.
+    private static func restored(
+        _ requested: WallpaperUserSettings,
+        in actual: WallpaperUserSettings
+    ) -> Bool {
+        switch (requested, actual) {
+        case (.allDisplays(let wanted), .allDisplays(let live)):
+            return wanted.choices == live.choices
+        case (.perDisplaySpace(let wanted), .perDisplaySpace(let live)):
+            return !wanted.isEmpty && wanted.allSatisfy { scope, content in
+                live[scope]?.choices == content.choices
+            }
+        default:
+            let wanted = Set(contents(in: requested).flatMap(\.choices))
+            let scopes = contents(in: actual)
+            guard !wanted.isEmpty, !scopes.isEmpty else { return false }
+            return scopes.allSatisfy { scope in
+                !scope.choices.isEmpty && scope.choices.allSatisfy(wanted.contains)
+            }
+        }
     }
 
     private static func decode(_ data: Data?) -> WallpaperUserSettings? {
@@ -146,7 +221,10 @@ enum PrivateWallpaperSettings {
         rejectingProviderIDs: Set<String>
     ) -> WallpaperUserSettings? {
         let candidate = decode(data) ?? legacyStoreSettings(from: data)
+        // A contentless backup restores nothing: writing it back leaves the
+        // Livecore selection in place and macOS then falls back on its own.
         guard let candidate,
+              hasChoices(candidate),
               !containsProvider(in: candidate, ids: rejectingProviderIDs)
         else { return nil }
         return candidate
@@ -215,6 +293,12 @@ enum PrivateWallpaperSettings {
         }
     }
 
+    /// False for the value the settings manager reports before WallpaperAgent
+    /// has answered, and for any snapshot that names no wallpaper at all.
+    private static func hasChoices(_ settings: WallpaperUserSettings) -> Bool {
+        contents(in: settings).contains { !$0.choices.isEmpty }
+    }
+
     private static func containsProvider(
         in settings: WallpaperUserSettings,
         ids: Set<String>
@@ -222,20 +306,6 @@ enum PrivateWallpaperSettings {
         guard !ids.isEmpty else { return false }
         return contents(in: settings).contains { content in
             content.choices.contains { ids.contains($0.descriptor.provider.rawValue) }
-        }
-    }
-
-    private static func settingsEqual(
-        _ lhs: WallpaperUserSettings,
-        _ rhs: WallpaperUserSettings
-    ) -> Bool {
-        switch (lhs, rhs) {
-        case (.allDisplays(let left), .allDisplays(let right)):
-            return left == right
-        case (.perDisplaySpace(let left), .perDisplaySpace(let right)):
-            return left == right
-        default:
-            return false
         }
     }
 }

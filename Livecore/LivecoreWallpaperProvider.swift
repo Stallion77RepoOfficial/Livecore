@@ -11,6 +11,7 @@ enum LivecoreProviderError: LocalizedError {
     case pluginKitFailed(String)
     case videoUnavailable
     case noDisplaysAvailable
+    case wallpaperSettingsUnavailable
     case lockScreenSelectionRejected
     case lockScreenRendererUnavailable
     case lockScreenRollbackFailed
@@ -29,6 +30,8 @@ enum LivecoreProviderError: LocalizedError {
             return "The prepared video is incomplete, so nothing was changed."
         case .noDisplaysAvailable:
             return "macOS reported no connected displays, so nothing was changed."
+        case .wallpaperSettingsUnavailable:
+            return "macOS did not report the current wallpaper, so nothing was changed."
         case .lockScreenSelectionRejected:
             return "macOS did not accept the Livecore Lock Screen selection."
         case .lockScreenRendererUnavailable:
@@ -373,13 +376,13 @@ private final class DistributedSignalWaiter: @unchecked Sendable {
     private var continuation: CheckedContinuation<Bool, Never>?
     private var result: Bool?
 
-    init(name: Notification.Name, object: String?) {
+    init(name: Notification.Name, object: String) {
         observer = center.addObserver(
             forName: name,
             object: nil,
             queue: nil
         ) { [weak self] notification in
-            guard object == nil || notification.object as? String == object else { return }
+            guard notification.object as? String == object else { return }
             self?.finish(true)
         }
     }
@@ -648,13 +651,17 @@ final class WallpaperStoreManager: @unchecked Sendable {
 
     private func applyLockScreenLocked(videoURL: URL) async throws {
         guard try isExtensionInstalled() else { throw LivecoreProviderError.extensionNotInstalled }
-        try await recycleExtensionLocked()
 
-        let previousItem = library.currentItem()
+        // Capture the restore point before any election is touched. Recycling
+        // deselects the extension, so a snapshot taken afterwards can describe
+        // the transient state macOS falls back to rather than the wallpaper the
+        // user actually had.
         let beforeSettings = try await PrivateWallpaperSettings.captureSettings()
         let previousSelection = try await PrivateWallpaperSettings.selection(
             providerIDs: Self.knownProviderIDs
         )
+        try await recycleExtensionLocked()
+        let previousItem = library.currentItem()
 
         let item = try await library.prepareVideo(
             at: videoURL,
@@ -677,6 +684,7 @@ final class WallpaperStoreManager: @unchecked Sendable {
             )
         } : nil
         var itemWasPublished = false
+        let backupBeforeApply = try? Data(contentsOf: library.lockScreenBackupURL)
 
         do {
             // `prepareVideo` creates the library directory on a clean install.
@@ -699,7 +707,12 @@ final class WallpaperStoreManager: @unchecked Sendable {
             try library.publish(item)
             itemWasPublished = true
             try await PrivateWallpaperSettings.apply(item: item, providerID: Self.providerID)
-            guard try await selectionSettles(on: item.id, providerID: Self.providerID) else {
+            guard try await selectionSettles(until: {
+                try await PrivateWallpaperSettings.selectionMatches(
+                    itemID: item.id,
+                    providerID: Self.providerID
+                )
+            }) else {
                 throw LivecoreProviderError.lockScreenSelectionRejected
             }
             notifyAssetsChanged()
@@ -709,7 +722,28 @@ final class WallpaperStoreManager: @unchecked Sendable {
         } catch {
             let operationError = error
             do {
-                try await PrivateWallpaperSettings.restore(from: [beforeSettings])
+                // The restore point this attempt wrote describes a wallpaper
+                // that was never taken over. Leaving it behind lets the next
+                // apply inherit it as if it were the user's own selection.
+                if let backupBeforeApply {
+                    try? backupBeforeApply.write(
+                        to: library.lockScreenBackupURL,
+                        options: .atomic
+                    )
+                } else {
+                    try? fileManager.removeItem(at: library.lockScreenBackupURL)
+                }
+                // Rolling back onto a Livecore selection whose assets are gone
+                // just recreates the dead wallpaper this apply was meant to
+                // replace, so in that case skip straight to the older backups.
+                if canServePreviousSelection(previousSelection) {
+                    try await PrivateWallpaperSettings.restore(from: [beforeSettings])
+                } else {
+                    try await PrivateWallpaperSettings.restore(
+                        from: backupDataCandidates(),
+                        rejectingProviderIDs: Self.knownProviderIDs
+                    )
+                }
                 if let previousItem {
                     try library.publish(previousItem)
                 } else {
@@ -747,18 +781,26 @@ final class WallpaperStoreManager: @unchecked Sendable {
         }
     }
 
+    /// True unless `selection` names a Livecore video the library can no longer
+    /// render. Anyone else's wallpaper is always worth going back to.
+    private func canServePreviousSelection(_ selection: LivecoreWallpaperSelection?) -> Bool {
+        guard let selection, selection.providerID == Self.providerID else { return true }
+        guard let itemID = selection.itemID,
+              let item = library.item(withID: itemID)
+        else { return false }
+        return library.itemIsUsable(item)
+    }
+
+    /// WallpaperAgent can echo a selection back and then revert it, so a state
+    /// only counts once it has held still for three consecutive reads.
     private func selectionSettles(
-        on expected: UUID,
-        providerID: String,
-        timeout: TimeInterval = 5
+        timeout: TimeInterval = 5,
+        until condition: () async throws -> Bool
     ) async throws -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         var consecutiveMatches = 0
         repeat {
-            if try await PrivateWallpaperSettings.selectionMatches(
-                itemID: expected,
-                providerID: providerID
-            ) {
+            if try await condition() {
                 consecutiveMatches += 1
                 if consecutiveMatches == 3 { return true }
             } else {
@@ -797,7 +839,11 @@ final class WallpaperStoreManager: @unchecked Sendable {
             from: backupDataCandidates(),
             rejectingProviderIDs: Self.knownProviderIDs
         )
-        guard try await selectionLeavesKnownProviders() else {
+        guard try await selectionSettles(until: {
+            try await PrivateWallpaperSettings.selection(
+                providerIDs: Self.knownProviderIDs
+            ) == nil
+        }) else {
             throw LivecoreProviderError.lockScreenSelectionRejected
         }
 
@@ -814,23 +860,6 @@ final class WallpaperStoreManager: @unchecked Sendable {
         } else if retiredAcknowledged, let selectedItem {
             library.discard(selectedItem)
         }
-    }
-
-    private func selectionLeavesKnownProviders(timeout: TimeInterval = 5) async throws -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
-        var consecutiveMatches = 0
-        repeat {
-            if try await PrivateWallpaperSettings.selection(
-                providerIDs: Self.knownProviderIDs
-            ) == nil {
-                consecutiveMatches += 1
-                if consecutiveMatches == 3 { return true }
-            } else {
-                consecutiveMatches = 0
-            }
-            try await Task.sleep(for: .milliseconds(100))
-        } while Date() < deadline
-        return false
     }
 
     // MARK: - Plumbing

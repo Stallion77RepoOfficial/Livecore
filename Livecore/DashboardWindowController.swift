@@ -414,7 +414,7 @@ final class DashboardWindowController: NSWindowController {
             return
         }
 
-        let scale = VideoScaleType.allCases[scaleControl.selectedSegment]
+        let scale = selectedScale
         do {
             try settings.saveVideoURL(selectedURL)
             settings.scaleType = scale
@@ -459,7 +459,7 @@ final class DashboardWindowController: NSWindowController {
         }
         do {
             try settings.saveVideoURL(selectedURL)
-            settings.scaleType = VideoScaleType.allCases[scaleControl.selectedSegment]
+            settings.scaleType = selectedScale
         } catch {
             setStatus(error.localizedDescription, error: true)
             return
@@ -478,15 +478,7 @@ final class DashboardWindowController: NSWindowController {
     @objc private func stopLockScreenWallpaper() {
         perform("Restoring Lock Screen…", success: "Lock Screen restored.") {
             try await WallpaperStoreManager.shared.deactivateLockScreen()
-            await MainActor.run {
-                if WallpaperEngine.shared.isActive {
-                    try? DesktopBackdropManager.shared.apply(
-                        scaleType: AppSettings.shared.scaleType
-                    )
-                } else {
-                    DesktopBackdropManager.shared.restore()
-                }
-            }
+            await Self.reclaimDesktopSlot()
         }
     }
 
@@ -494,15 +486,7 @@ final class DashboardWindowController: NSWindowController {
         if lockState?.extensionInstalled == true {
             perform("Removing Livecore extension…", success: "Extension removed.") {
                 try await WallpaperStoreManager.shared.uninstallExtension()
-                await MainActor.run {
-                    if WallpaperEngine.shared.isActive {
-                        try? DesktopBackdropManager.shared.apply(
-                            scaleType: AppSettings.shared.scaleType
-                        )
-                    } else {
-                        DesktopBackdropManager.shared.restore()
-                    }
-                }
+                await Self.reclaimDesktopSlot()
             }
         } else {
             perform("Installing Livecore extension…", success: "Extension installed.") {
@@ -511,10 +495,30 @@ final class DashboardWindowController: NSWindowController {
         }
     }
 
+    /// Giving up the Lock Screen hands the Desktop slot back. Whoever should
+    /// own it now takes it: Livecore's poster while Desktop playback runs, the
+    /// user's own picture otherwise.
+    @MainActor
+    private static func reclaimDesktopSlot() {
+        if WallpaperEngine.shared.isActive {
+            try? DesktopBackdropManager.shared.apply(scaleType: AppSettings.shared.scaleType)
+        } else {
+            DesktopBackdropManager.shared.restore()
+        }
+    }
+
     @objc private func scaleChanged() {
-        let scale = VideoScaleType.allCases[scaleControl.selectedSegment]
+        let scale = selectedScale
         settings.scaleType = scale
         WallpaperEngine.shared.setScale(scale)
+    }
+
+    /// `selectedSegment` is -1 while nothing is selected, so the stored setting
+    /// is the fallback rather than an out-of-range index.
+    private var selectedScale: VideoScaleType {
+        let index = scaleControl.selectedSegment
+        guard VideoScaleType.allCases.indices.contains(index) else { return settings.scaleType }
+        return VideoScaleType.allCases[index]
     }
 
     /// The menu bar writes the same setting, so the window re-reads it whenever

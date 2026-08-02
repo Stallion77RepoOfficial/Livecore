@@ -202,8 +202,15 @@ final class WallpaperSurface {
     }
 
     private func configureWindow() {
-        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)) + 1)
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        // Exactly the Desktop level: one step above it and "Show Desktop" slides
+        // this window aside with the ordinary ones, uncovering the real Desktop
+        // picture underneath. Icons live at `.desktopIconWindow`, so they stay
+        // above the video without needing the extra step.
+        window.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopWindow)))
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenNone]
+        window.isMovable = false
+        window.isMovableByWindowBackground = false
+        window.isExcludedFromWindowsMenu = true
         window.isOpaque = false
         window.backgroundColor = .clear
         window.hasShadow = false

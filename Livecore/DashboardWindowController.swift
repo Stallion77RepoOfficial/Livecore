@@ -5,7 +5,9 @@ import AVKit
 final class DashboardWindowController: NSWindowController {
     private let settings = AppSettings.shared
     private let preview = AVPlayerView()
-    private let pathLabel = NSTextField(labelWithString: "No video selected")
+    private let previewLabel = NSTextField(labelWithString: "Preview")
+    private let desktopPathLabel = NSTextField(labelWithString: "No video selected")
+    private let lockScreenPathLabel = NSTextField(labelWithString: "No video selected")
     private let statusLabel = NSTextField(labelWithString: "Ready")
     private let scaleControl = NSSegmentedControl(
         labels: VideoScaleType.allCases.map(\.title),
@@ -16,21 +18,24 @@ final class DashboardWindowController: NSWindowController {
     private let loginSwitch = NSSwitch()
     private let keepAwakeSwitch = NSSwitch()
 
-    private var selectedURL: URL?
+    /// One video per slot. The Desktop and the Lock Screen are driven by
+    /// different renderers, so neither selection constrains the other.
+    private var selectedURLs: [WallpaperSlot: URL] = [:]
     private var previewSecurityScopedURL: URL?
     private var queuePlayer: AVQueuePlayer?
     private var playerLooper: AVPlayerLooper?
     private var isBusy = false
     /// nil until the first successful read of the macOS wallpaper settings.
     private var lockState: LivecoreLockScreenState?
-    /// Set when the user picks a different video, so an already-applied Lock
-    /// Screen can be replaced without first stopping it.
+    /// Set when the user picks a different Lock Screen video, so an already
+    /// applied one can be replaced without first stopping it.
     private var hasUnappliedSelection = false
 
     private var localObservers: [NSObjectProtocol] = []
     private var distributedObservers: [NSObjectProtocol] = []
 
-    private var chooseButton: NSButton?
+    private var chooseDesktopButton: NSButton?
+    private var chooseLockScreenButton: NSButton?
     private var playButton: NSButton?
     private var lockScreenButton: NSButton?
     private var stopDesktopButton: NSButton?
@@ -39,7 +44,7 @@ final class DashboardWindowController: NSWindowController {
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 920, height: 650),
+            contentRect: NSRect(x: 0, y: 0, width: 920, height: 780),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -47,7 +52,7 @@ final class DashboardWindowController: NSWindowController {
         window.title = "Livecore"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
-        window.minSize = NSSize(width: 780, height: 580)
+        window.minSize = NSSize(width: 780, height: 700)
         window.center()
         window.isReleasedWhenClosed = false
         window.appearance = NSAppearance(named: .darkAqua)
@@ -102,34 +107,50 @@ final class DashboardWindowController: NSWindowController {
         preview.layer?.backgroundColor = NSColor(calibratedWhite: 0.06, alpha: 1).cgColor
         preview.heightAnchor.constraint(equalToConstant: 330).isActive = true
 
-        let choose = actionButton("Choose Video", symbol: "plus", action: #selector(chooseVideo), prominent: true)
+        let chooseDesktop = actionButton("Choose Video", symbol: "plus", action: #selector(chooseDesktopVideo))
         let play = actionButton("Apply to Desktop", symbol: "play.fill", action: #selector(applyToDesktop), prominent: true)
         play.keyEquivalent = "\r"
-        let lockScreen = actionButton("Apply to Lock Screen", symbol: "lock.fill", action: #selector(applyToLockScreen), prominent: true)
         let stopDesktop = actionButton("Stop Desktop", symbol: "stop.fill", action: #selector(stopDesktopWallpaper))
+
+        let chooseLockScreen = actionButton("Choose Video", symbol: "plus", action: #selector(chooseLockScreenVideo))
+        let lockScreen = actionButton("Apply to Lock Screen", symbol: "lock.fill", action: #selector(applyToLockScreen), prominent: true)
         let stopLockScreen = actionButton("Stop Lock Screen", symbol: "lock.slash", action: #selector(stopLockScreenWallpaper))
         let extensionToggle = actionButton("Remove Extension", symbol: "trash", action: #selector(toggleExtension))
 
-        chooseButton = choose
+        chooseDesktopButton = chooseDesktop
+        chooseLockScreenButton = chooseLockScreen
         playButton = play
         lockScreenButton = lockScreen
         stopDesktopButton = stopDesktop
         stopLockScreenButton = stopLockScreen
         extensionButton = extensionToggle
 
-        let videoButtons = NSStackView(views: [choose, play, lockScreen, stopDesktop, stopLockScreen, extensionToggle])
-        videoButtons.orientation = .horizontal
-        videoButtons.spacing = 8
+        for label in [desktopPathLabel, lockScreenPathLabel] {
+            label.lineBreakMode = .byTruncatingMiddle
+            label.textColor = .secondaryLabelColor
+            label.maximumNumberOfLines = 1
+        }
+        previewLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        previewLabel.textColor = .secondaryLabelColor
 
-        pathLabel.lineBreakMode = .byTruncatingMiddle
-        pathLabel.textColor = .secondaryLabelColor
-        pathLabel.maximumNumberOfLines = 1
+        let desktopCard = card(
+            title: "Desktop",
+            content: slotRow(
+                buttons: [chooseDesktop, play, stopDesktop],
+                path: desktopPathLabel
+            )
+        )
+        let lockScreenCard = card(
+            title: "Lock Screen",
+            content: slotRow(
+                buttons: [chooseLockScreen, lockScreen, stopLockScreen, extensionToggle],
+                path: lockScreenPathLabel
+            )
+        )
+
         scaleControl.target = self
         scaleControl.action = #selector(scaleChanged)
-
-        let scaleStack = NSStackView(views: [scaleControl, pathLabel])
-        scaleStack.spacing = 12
-        let displayCard = card(title: "Type & Scale", content: scaleStack)
+        let displayCard = card(title: "Desktop Type & Scale", content: scaleControl)
 
         loginSwitch.target = self
         loginSwitch.action = #selector(loginChanged)
@@ -150,7 +171,10 @@ final class DashboardWindowController: NSWindowController {
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
 
-        let rows: [NSView] = [preview, videoButtons, displayCard, startupCard, statusLabel]
+        let rows: [NSView] = [
+            preview, previewLabel, desktopCard, lockScreenCard,
+            displayCard, startupCard, statusLabel,
+        ]
         let stack = NSStackView(views: rows)
         stack.orientation = .vertical
         stack.alignment = .leading
@@ -197,6 +221,20 @@ final class DashboardWindowController: NSWindowController {
         return visual
     }
 
+    /// One slot's controls: its buttons above the video it currently points at.
+    private func slotRow(buttons: [NSButton], path: NSTextField) -> NSView {
+        let row = NSStackView(views: buttons)
+        row.orientation = .horizontal
+        row.spacing = 8
+
+        let stack = NSStackView(views: [row, path])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        path.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        return stack
+    }
+
     private func switchRow(_ title: String, control: NSSwitch) -> NSStackView {
         let row = NSStackView(views: [NSTextField(labelWithString: title), NSView(), control])
         row.orientation = .horizontal
@@ -228,13 +266,33 @@ final class DashboardWindowController: NSWindowController {
         loginSwitch.state = LoginItemManager.shared.isEnabled ? .on : .off
         keepAwakeSwitch.state = settings.keepScreenAwakeOnLock ? .on : .off
 
-        do {
-            selectedURL = try settings.resolveVideoURL()
-            if let selectedURL {
-                showPreview(selectedURL)
+        var failure: Error?
+        for slot in WallpaperSlot.allCases {
+            do {
+                selectedURLs[slot] = try settings.resolveVideoURL(for: slot)
+            } catch {
+                // One unreadable bookmark must not hide the other slot's video.
+                failure = failure ?? error
             }
-        } catch {
-            setStatus(error.localizedDescription, error: true)
+        }
+        updatePathLabels()
+
+        if let url = selectedURLs[.desktop] {
+            showPreview(url, slot: .desktop)
+        } else if let url = selectedURLs[.lockScreen] {
+            showPreview(url, slot: .lockScreen)
+        }
+        if let failure {
+            setStatus(failure.localizedDescription, error: true)
+        }
+    }
+
+    private func updatePathLabels() {
+        for (slot, label) in [
+            (WallpaperSlot.desktop, desktopPathLabel),
+            (WallpaperSlot.lockScreen, lockScreenPathLabel),
+        ] {
+            label.stringValue = selectedURLs[slot]?.path ?? "No video selected"
         }
     }
 
@@ -254,12 +312,12 @@ final class DashboardWindowController: NSWindowController {
     }
 
     private func updateButtonStates() {
-        let hasVideo = selectedURL != nil
         let isDesktopActive = WallpaperEngine.shared.isActive || settings.desktopEnabled
 
-        chooseButton?.isEnabled = !isBusy
+        chooseDesktopButton?.isEnabled = !isBusy
+        chooseLockScreenButton?.isEnabled = !isBusy
         scaleControl.isEnabled = !isBusy
-        playButton?.isEnabled = !isBusy && hasVideo && !isDesktopActive
+        playButton?.isEnabled = !isBusy && selectedURLs[.desktop] != nil && !isDesktopActive
         stopDesktopButton?.isEnabled = !isBusy && isDesktopActive
 
         // Everything below needs to know what macOS is actually showing.
@@ -277,7 +335,7 @@ final class DashboardWindowController: NSWindowController {
         // video is live the button stays locked until the user stops the Lock
         // Screen or picks a different video.
         lockScreenButton?.isEnabled = !isBusy
-            && hasVideo
+            && selectedURLs[.lockScreen] != nil
             && lockState.extensionInstalled
             && (!lockState.isApplied || hasUnappliedSelection)
 
@@ -321,13 +379,13 @@ final class DashboardWindowController: NSWindowController {
         })
     }
 
-    private func showPreview(_ url: URL) {
+    private func showPreview(_ url: URL, slot: WallpaperSlot) {
         playerLooper = nil
         queuePlayer?.pause()
         queuePlayer = nil
         previewSecurityScopedURL?.stopAccessingSecurityScopedResource()
         previewSecurityScopedURL = url.startAccessingSecurityScopedResource() ? url : nil
-        pathLabel.stringValue = url.path
+        previewLabel.stringValue = "Preview — \(slot.title)"
 
         let item = AVPlayerItem(url: url)
         let player = AVQueuePlayer(playerItem: item)
@@ -394,29 +452,36 @@ final class DashboardWindowController: NSWindowController {
 
     // MARK: - Actions
 
-    @objc private func chooseVideo() {
+    @objc private func chooseDesktopVideo() { chooseVideo(for: .desktop) }
+
+    @objc private func chooseLockScreenVideo() { chooseVideo(for: .lockScreen) }
+
+    private func chooseVideo(for slot: WallpaperSlot) {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else {
             return
         }
-        selectedURL = url
-        hasUnappliedSelection = true
-        showPreview(url)
-        setStatus("Video is ready. Apply it to Desktop or Lock Screen.")
+        selectedURLs[slot] = url
+        if slot == .lockScreen {
+            hasUnappliedSelection = true
+        }
+        updatePathLabels()
+        showPreview(url, slot: slot)
+        setStatus("Video is ready. Apply it to the \(slot.title).")
         updateButtonStates()
     }
 
     @objc private func applyToDesktop() {
-        guard let selectedURL else {
-            setStatus("Choose a video first.", error: true)
+        guard let videoURL = selectedURLs[.desktop] else {
+            setStatus("Choose a Desktop video first.", error: true)
             return
         }
 
         let scale = selectedScale
         do {
-            try settings.saveVideoURL(selectedURL)
+            try settings.saveVideoURL(videoURL, for: .desktop)
             settings.scaleType = scale
         } catch {
             setStatus(error.localizedDescription, error: true)
@@ -428,7 +493,7 @@ final class DashboardWindowController: NSWindowController {
         Task {
             do {
                 try await WallpaperEngine.shared.start(
-                    videoURL: selectedURL,
+                    videoURL: videoURL,
                     scaleType: scale
                 )
                 settings.desktopEnabled = true
@@ -449,8 +514,8 @@ final class DashboardWindowController: NSWindowController {
     }
 
     @objc private func applyToLockScreen() {
-        guard let selectedURL else {
-            setStatus("Choose a video first.", error: true)
+        guard let videoURL = selectedURLs[.lockScreen] else {
+            setStatus("Choose a Lock Screen video first.", error: true)
             return
         }
         guard lockState?.extensionInstalled == true else {
@@ -458,14 +523,12 @@ final class DashboardWindowController: NSWindowController {
             return
         }
         do {
-            try settings.saveVideoURL(selectedURL)
-            settings.scaleType = selectedScale
+            try settings.saveVideoURL(videoURL, for: .lockScreen)
         } catch {
             setStatus(error.localizedDescription, error: true)
             return
         }
 
-        let videoURL = selectedURL
         perform(
             "Rendering…",
             success: "Applied to Lock Screen.",

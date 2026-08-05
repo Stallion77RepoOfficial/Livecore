@@ -27,11 +27,31 @@ enum VideoScaleType: String, CaseIterable {
     }
 }
 
+/// The two wallpapers Livecore can drive. They are rendered by entirely
+/// separate machinery — the Desktop by `WallpaperEngine`'s own windows, the
+/// Lock Screen by the wallpaper extension — so each keeps its own video.
+enum WallpaperSlot: CaseIterable {
+    case desktop
+    case lockScreen
+
+    var title: String {
+        switch self {
+        case .desktop: return "Desktop"
+        case .lockScreen: return "Lock Screen"
+        }
+    }
+}
+
 final class AppSettings {
     static let shared = AppSettings()
 
     private enum Key {
+        /// Written by every Livecore version, and still the Desktop slot's key.
+        /// A build that predates per-slot videos stored one video here for both
+        /// slots, so it is also what an absent Lock Screen bookmark falls back
+        /// to — an upgrade keeps showing what the user already applied.
         static let videoBookmark = "videoBookmark"
+        static let lockScreenVideoBookmark = "lockScreenVideoBookmark"
         static let scaleType = "scaleType"
         static let desktopEnabled = "desktopEnabled"
         static let keepScreenAwakeOnLock = "keepScreenAwakeOnLock"
@@ -56,19 +76,21 @@ final class AppSettings {
         set { defaults.set(newValue, forKey: Key.keepScreenAwakeOnLock) }
     }
 
-    func saveVideoURL(_ url: URL) throws {
+    func saveVideoURL(_ url: URL, for slot: WallpaperSlot) throws {
         let bookmark = try url.bookmarkData(
             options: [.withSecurityScope],
             includingResourceValuesForKeys: nil,
             relativeTo: nil
         )
-        defaults.set(bookmark, forKey: Key.videoBookmark)
+        defaults.set(bookmark, forKey: Self.bookmarkKey(for: slot))
     }
 
-    func resolveVideoURL() throws -> URL? {
-        guard let bookmark = defaults.data(forKey: Key.videoBookmark) else {
-            return nil
-        }
+    func resolveVideoURL(for slot: WallpaperSlot) throws -> URL? {
+        let key = Self.bookmarkKey(for: slot)
+        guard let bookmark = defaults.data(forKey: key)
+            ?? Self.legacyBookmarkKey(for: slot).flatMap(defaults.data(forKey:))
+        else { return nil }
+
         var stale = false
         let url = try URL(
             resolvingBookmarkData: bookmark,
@@ -76,10 +98,26 @@ final class AppSettings {
             relativeTo: nil,
             bookmarkDataIsStale: &stale
         )
-        if stale {
-            try saveVideoURL(url)
+        // A shared legacy bookmark is copied into the slot's own key on first
+        // read, so the two slots diverge from the next change onwards.
+        if stale || defaults.data(forKey: key) == nil {
+            try saveVideoURL(url, for: slot)
         }
         return url
+    }
+
+    private static func bookmarkKey(for slot: WallpaperSlot) -> String {
+        switch slot {
+        case .desktop: return Key.videoBookmark
+        case .lockScreen: return Key.lockScreenVideoBookmark
+        }
+    }
+
+    private static func legacyBookmarkKey(for slot: WallpaperSlot) -> String? {
+        switch slot {
+        case .desktop: return nil
+        case .lockScreen: return Key.videoBookmark
+        }
     }
 
     /// App deletion does not remove UserDefaults, so a replaced bundle must not
@@ -720,14 +758,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         Task {
             do {
-                let videoURL = try AppSettings.shared.resolveVideoURL()
+                let videoURL = try AppSettings.shared.resolveVideoURL(for: .desktop)
                 if AppSettings.shared.desktopEnabled, let videoURL {
                     try await WallpaperEngine.shared.start(
                         videoURL: videoURL,
                         scaleType: AppSettings.shared.scaleType
                     )
                 }
-                if videoURL == nil {
+                // Nothing to show on either slot means a first run.
+                if videoURL == nil,
+                   try AppSettings.shared.resolveVideoURL(for: .lockScreen) == nil {
                     showSettings()
                 }
             } catch {
@@ -807,7 +847,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updatePlaybackMenuItemStates() {
-        let hasVideo = (try? AppSettings.shared.resolveVideoURL()) != nil
+        let hasVideo = (try? AppSettings.shared.resolveVideoURL(for: .desktop)) != nil
         let isDesktopActive = WallpaperEngine.shared.isActive
         playMenuItem?.isEnabled = hasVideo && !isDesktopActive
         stopMenuItem?.isEnabled = isDesktopActive
@@ -836,7 +876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func playSavedVideo() {
         Task {
             do {
-                guard let url = try AppSettings.shared.resolveVideoURL() else {
+                guard let url = try AppSettings.shared.resolveVideoURL(for: .desktop) else {
                     showSettings()
                     return
                 }
